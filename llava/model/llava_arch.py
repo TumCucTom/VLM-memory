@@ -25,6 +25,7 @@ from .multimodal_spatial_encoder.builder import build_spatial_tower
 from .multimodal_fusion_block.builder import build_multimodal_fusion_block
 from .multimodal_resampler.builder import build_vision_resampler
 from .multimodal_projector.builder import build_vision_projector
+from .memory import DualMemoryModule
 from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 
 from llava.mm_utils import get_anyres_image_grid_shape
@@ -57,6 +58,21 @@ class LlavaMetaModel:
 
             if "unpad" in getattr(config, "mm_patch_merge_type", ""):
                 self.image_newline = nn.Parameter(torch.empty(config.hidden_size, dtype=self.dtype))
+            
+            # Initialize dual-memory module if enabled
+            if getattr(config, "use_dual_memory", False):
+                L_w = getattr(config, "memory_L_w", 8)  # Working memory capacity
+                L_e = getattr(config, "memory_L_e", 32)  # Episodic memory capacity
+                feature_dim = getattr(config, "mm_hidden_size", config.hidden_size)
+                self.dual_memory = DualMemoryModule(
+                    L_w=L_w,
+                    L_e=L_e,
+                    feature_dim=feature_dim,
+                    num_heads=getattr(config, "memory_num_heads", 8),
+                    dropout=getattr(config, "memory_dropout", 0.1)
+                )
+            else:
+                self.dual_memory = None
 
     def get_vision_tower(self):
         vision_tower = getattr(self, "vision_tower", None)
@@ -307,9 +323,36 @@ class LlavaMetaForCausalLM(ABC):
 
     #     return image_features
 
-    def encode_images(self, images, spatial_features=None, point_maps=None):
+    def encode_images(self, images, spatial_features=None, point_maps=None, is_video=False, video_id=None):
+        """
+        Encode images/video frames with optional dual-memory processing
+        
+        Args:
+            images: Input images [B, C, H, W] or [F, B, C, H, W] for video
+            spatial_features: Pre-computed spatial features (optional)
+            point_maps: Point maps for point-based fusion (optional)
+            is_video: Whether input is a video (multiple frames)
+            video_id: Unique identifier for video (for memory state management)
+        """
         # vision features
         image_features = self.get_model().get_vision_tower()(images)
+        
+        # Check if dual memory is enabled and this is a video
+        use_memory = (self.get_model().dual_memory is not None and is_video)
+        
+        # Initialize or get memory state for this video
+        if use_memory:
+            if not hasattr(self, '_video_memories'):
+                self._video_memories = {}
+            if video_id is None:
+                video_id = id(images)  # Fallback to object id
+            if video_id not in self._video_memories:
+                # Initialize new memory state for this video
+                self._video_memories[video_id] = {
+                    'W_t': [],
+                    'E_t': []
+                }
+        
         # fuse with spatial features
         if self.get_model().get_spatial_tower() is not None and self.get_model().get_fusion_block() is not None:
             spatial_encoder_type = self.get_model().config.spatial_tower
@@ -318,6 +361,13 @@ class LlavaMetaForCausalLM(ABC):
             if spatial_encoder_type.endswith("points"):
                 points = self.get_model().get_spatial_tower()(images)
                 image_features = self.get_model().get_fusion_block()(image_features, points)
+                
+                # Apply memory if enabled and video
+                if use_memory:
+                    image_features = self._apply_memory_to_features(
+                        image_features, video_id, is_video
+                    )
+                
                 image_features = self.get_model().mm_projector(image_features)
             
             else:
@@ -342,10 +392,24 @@ class LlavaMetaForCausalLM(ABC):
                             raise ValueError(f"Unexpected spatial_tower_select_feature: {spatial_tower_select_feature}")
                     final_image_features = torch.cat(final_image_features, dim=1).to(self.dtype)
                     image_features, attn_weights = self.get_model().get_fusion_block()(image_features, final_image_features)
+                    
+                    # Apply memory if enabled and video
+                    if use_memory:
+                        image_features = self._apply_memory_to_features(
+                            image_features, video_id, is_video
+                        )
+                    
                     image_features = self.get_model().mm_projector(image_features)
                 
                 elif fusion_block_type == 'cross_attention_with_mlp':
                     image_features, attn_weights = self.get_model().get_fusion_block()(image_features, patch_tokens)
+                    
+                    # Apply memory if enabled and video
+                    if use_memory:
+                        image_features = self._apply_memory_to_features(
+                            image_features, video_id, is_video
+                        )
+                    
                     image_features = self.get_model().mm_projector(image_features)
 
                 elif fusion_block_type == 'transformer':
@@ -353,6 +417,13 @@ class LlavaMetaForCausalLM(ABC):
                     if spatial_tower_select_feature == "all":
                         final_image_features = torch.cat((camera_tokens, patch_tokens), dim=1).to(self.dtype)
                         image_features = self.get_model().get_fusion_block()(image_features, final_image_features)
+                        
+                        # Apply memory if enabled and video
+                        if use_memory:
+                            image_features = self._apply_memory_to_features(
+                                image_features, video_id, is_video
+                            )
+                        
                         image_features = self.get_model().mm_projector(image_features)
 
                 elif (fusion_block_type == 'mlp_after_clip_proj' 
@@ -361,15 +432,120 @@ class LlavaMetaForCausalLM(ABC):
 
                     image_features = self.get_model().mm_projector(image_features)
                     image_features = self.get_model().get_fusion_block()(image_features, patch_tokens)
+                    
+                    # Apply memory if enabled and video (after projection in this case)
+                    if use_memory:
+                        image_features = self._apply_memory_to_features(
+                            image_features, video_id, is_video
+                        )
 
         elif self.get_model().get_spatial_tower() is None and self.get_model().get_fusion_block() is not None:
             assert point_maps is not None
             image_features = self.get_model().mm_projector(image_features)
             image_features = self.get_model().get_fusion_block()(image_features, point_maps[0]) # FIXME: point_maps is a list of tensors, each tensor is a point map for one image
+            
+            # Apply memory if enabled and video
+            if use_memory:
+                image_features = self._apply_memory_to_features(
+                    image_features, video_id, is_video
+                )
 
         else:
             image_features = self.get_model().mm_projector(image_features)
+            
+            # Apply memory if enabled and video
+            if use_memory:
+                image_features = self._apply_memory_to_features(
+                    image_features, video_id, is_video
+                )
+        
         return image_features
+    
+    def _apply_memory_to_features(self, image_features, video_id, is_video):
+        """
+        Apply dual-memory module to features (Algorithm 1)
+        
+        Args:
+            image_features: Fused features [B, N, D] or [F, B, N, D] for video
+            video_id: Video identifier for memory state
+            is_video: Whether processing video frames
+        
+        Returns:
+            Memory-enhanced features [B, N, D] or [F, B, N, D]
+        """
+        if not is_video or self.get_model().dual_memory is None:
+            return image_features
+        
+        # Get memory state for this video
+        if video_id not in self._video_memories:
+            self._video_memories[video_id] = {'W_t': [], 'E_t': []}
+        memory_state = self._video_memories[video_id]
+        W_t = memory_state['W_t']
+        E_t = memory_state['E_t']
+        
+        # Process frames sequentially
+        if image_features.dim() == 4:  # [F, B, N, D] - video frames with separate frame dimension
+            num_frames = image_features.shape[0]
+            memory_enhanced_features = []
+            
+            for frame_idx in range(num_frames):
+                H_t = image_features[frame_idx]  # [B, N, D] - current frame
+                
+                # Apply dual-memory module (Algorithm 1)
+                M_t, W_t_1, E_t_1 = self.get_model().dual_memory(H_t, W_t, E_t)
+                
+                # Update memory state
+                memory_state['W_t'] = W_t_1
+                memory_state['E_t'] = E_t_1
+                W_t = W_t_1
+                E_t = E_t_1
+                
+                memory_enhanced_features.append(M_t)
+            
+            # Stack frames back: [F, B, N, D]
+            image_features = torch.stack(memory_enhanced_features, dim=0)
+        elif image_features.dim() == 3:  # [B, N, D] - batch of frames or single frame
+            # For video, process each frame in batch sequentially
+            # Note: This assumes B dimension contains frames
+            batch_size = image_features.shape[0]
+            memory_enhanced_features = []
+            
+            for batch_idx in range(batch_size):
+                H_t = image_features[batch_idx:batch_idx+1]  # [1, N, D] - keep batch dim
+                
+                # Apply dual-memory module (Algorithm 1)
+                M_t, W_t_1, E_t_1 = self.get_model().dual_memory(H_t, W_t, E_t)
+                
+                # Update memory state
+                memory_state['W_t'] = W_t_1
+                memory_state['E_t'] = E_t_1
+                W_t = W_t_1
+                E_t = E_t_1
+                
+                memory_enhanced_features.append(M_t.squeeze(0))  # Remove batch dim for stacking
+            
+            # Stack frames back: [B, N, D]
+            image_features = torch.stack(memory_enhanced_features, dim=0)
+        else:
+            # Unexpected shape, return as-is
+            pass
+        
+        return image_features
+    
+    def clear_video_memory(self, video_id=None):
+        """
+        Clear memory state for a specific video or all videos
+        
+        Args:
+            video_id: Specific video ID to clear, or None to clear all
+        """
+        if hasattr(self, '_video_memories'):
+            if video_id is None:
+                # Clear all memories
+                self._video_memories = {}
+            elif video_id in self._video_memories:
+                # Clear specific video memory
+                del self._video_memories[video_id]
     
     def encode_multimodals(self, videos_or_images, video_idx_in_batch, split_sizes=None):
         videos_or_images_features = self.get_model().get_vision_tower()(videos_or_images)
@@ -430,6 +606,11 @@ class LlavaMetaForCausalLM(ABC):
         if vision_tower is None or images is None or input_ids.shape[1] == 1:
             return input_ids, position_ids, attention_mask, past_key_values, None, labels
 
+        # Reset memory at start of each forward pass during training
+        # This ensures memory state doesn't contaminate between samples
+        if self.training and hasattr(self, '_video_memories'):
+            self.clear_video_memory()
+
         if isinstance(modalities, str):
             modalities = [modalities]
 
@@ -452,7 +633,27 @@ class LlavaMetaForCausalLM(ABC):
 
             concat_images = torch.cat([image for image in images_list], dim=0)
             split_sizes = [image.shape[0] for image in images_list]
-            encoded_image_features = self.encode_images(concat_images, spatial_features, point_maps)
+            
+            # Detect if this is a video (multiple frames) and get video IDs
+            is_video = len(video_idx_in_batch) > 0
+            video_ids = []
+            current_video_id = 0
+            for idx, image in enumerate(images_list):
+                if idx in video_idx_in_batch:
+                    video_ids.append(current_video_id)
+                    current_video_id += 1
+                else:
+                    video_ids.append(None)
+            
+            # For now, process all frames together but mark as video
+            # In future, could process frame-by-frame for better memory integration
+            encoded_image_features = self.encode_images(
+                concat_images, 
+                spatial_features, 
+                point_maps,
+                is_video=is_video,
+                video_id=video_ids[0] if is_video else None
+            )
             # if self.get_model().get_spatial_tower() is not None:
             #     if spatial_features is None:
             #         camera_tokens, patch_tokens = self.encode_spatial_features(concat_images)
