@@ -168,7 +168,7 @@ class ModelArguments:
     model_class_name: Optional[str] = field(default=None, metadata={"help": "Used to init model class, format is XXXXForCausalLM. e.g. currently XXXX is chosen from LlavaLlama, LlavaMixtral, LlavaMistral, Llama"})
 
     mm_tunable_parts: Optional[str] = field(
-        default=None, metadata={"help": 'Could be "mm_mlp_adapter", "mm_vision_resampler", "dual_memory", "mm_vision_tower,mm_mlp_adapter,mm_language_model", "mm_vision_tower,mm_mlp_adapter,mm_language_model", "mm_mlp_adapter,mm_language_model", "dual_memory,mm_mlp_adapter" etc.'}
+        default=None, metadata={"help": 'Could be "mm_mlp_adapter", "mm_vision_resampler", "mm_vision_tower,mm_mlp_adapter,mm_language_model", "mm_vision_tower,mm_mlp_adapter,mm_language_model", "mm_mlp_adapter,mm_language_model"'}
     )
     # deciding which part of the multimodal model to tune, will overwrite other previous settings
 
@@ -190,14 +190,6 @@ class ModelArguments:
     ## fusion block
     fusion_block: Optional[str] = field(default=None)
     tune_fusion_block: bool = field(default=False)
-    
-    ## dual memory module
-    use_dual_memory: bool = field(default=False, metadata={"help": "Enable dual-memory module for VLM²"})
-    memory_L_w: int = field(default=8, metadata={"help": "Working memory capacity (window size)"})
-    memory_L_e: int = field(default=32, metadata={"help": "Episodic memory capacity"})
-    memory_num_heads: int = field(default=8, metadata={"help": "Number of attention heads for memory retrieval"})
-    memory_dropout: float = field(default=0.1, metadata={"help": "Dropout rate for memory attention"})
-    tune_dual_memory: bool = field(default=True, metadata={"help": "Train dual-memory modules (default: True)"})
 
     unfreeze_mm_vision_tower: bool = field(default=False)
     unfreeze_language_model: bool = field(default=False)
@@ -1963,14 +1955,6 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
 
     if model_args.fusion_block is not None:
         overwrite_config["fusion_block"] = model_args.fusion_block
-    
-    # Dual memory configuration
-    if model_args.use_dual_memory:
-        overwrite_config["use_dual_memory"] = True
-        overwrite_config["memory_L_w"] = model_args.memory_L_w
-        overwrite_config["memory_L_e"] = model_args.memory_L_e
-        overwrite_config["memory_num_heads"] = model_args.memory_num_heads
-        overwrite_config["memory_dropout"] = model_args.memory_dropout
 
     if overwrite_config:
         assert cfg_pretrained is not None, "cfg_pretrained is None"
@@ -2226,14 +2210,6 @@ def train(attn_implementation=None):
         model.config.fusion_block = model_args.fusion_block
         model.config.fusion_block_lr = training_args.fusion_block_lr
 
-    # Initialize and setup dual-memory module if enabled
-    if model_args.use_dual_memory:
-        if model.get_model().dual_memory is not None:
-            dual_memory = model.get_model().dual_memory
-            dual_memory.to(dtype=torch.bfloat16 if training_args.bf16 else torch.float16, device=training_args.device)
-            rank0_print(f"Dual-memory module initialized: L_w={model_args.memory_L_w}, L_e={model_args.memory_L_e}")
-        else:
-            rank0_print("WARNING: use_dual_memory=True but dual_memory module is None. Check model initialization.")
 
     if model_args.vision_tower is not None:
         model.get_model().initialize_vision_modules(model_args=model_args, fsdp=training_args.fsdp)
@@ -2282,7 +2258,6 @@ def train(attn_implementation=None):
             model.config.tune_mm_vision_resampler = training_args.tune_mm_vision_resampler = model_args.tune_mm_vision_resampler
             model.config.tune_spatial_tower = training_args.tune_spatial_tower = model_args.tune_spatial_tower
             model.config.tune_fusion_block = training_args.tune_fusion_block = model_args.tune_fusion_block
-            model.config.tune_dual_memory = model_args.tune_dual_memory
             if model_args.tune_mm_mlp_adapter or model_args.tune_mm_vision_resampler or model_args.tune_fusion_block or model_args.tune_spatial_tower:
                 model.requires_grad_(False)
             if training_args.lora_enable:
@@ -2295,13 +2270,6 @@ def train(attn_implementation=None):
             if model_args.tune_fusion_block:
                 for p in model.get_fusion_block().parameters():
                     p.requires_grad = True
-            if model_args.use_dual_memory and model_args.tune_dual_memory:
-                if model.get_model().dual_memory is not None:
-                    for p in model.get_model().dual_memory.parameters():
-                        p.requires_grad = True
-                    rank0_print("Dual-memory modules set to trainable")
-                else:
-                    rank0_print("WARNING: use_dual_memory=True but dual_memory module is None. Check model initialization.")
             if model_args.tune_mm_mlp_adapter:
                 for p in model.get_model().mm_projector.parameters():
                     p.requires_grad = True
@@ -2345,13 +2313,6 @@ def train(attn_implementation=None):
                 for name, param in model.named_parameters():
                     if "vision_tower" in name:
                         param.requires_grad_(True)
-            if "dual_memory" in tunable_parts:
-                if model.get_model().dual_memory is not None:
-                    for p in model.get_model().dual_memory.parameters():
-                        p.requires_grad = True
-                    rank0_print("Dual-memory modules set to trainable (via mm_tunable_parts)")
-                else:
-                    rank0_print("WARNING: dual_memory in mm_tunable_parts but dual_memory module is None")
             if "mm_language_model" in tunable_parts:
                 for name, param in model.named_parameters():
                     if "vision_tower" not in name and "mm_projector" not in name and "vision_resampler" not in name:

@@ -60,14 +60,20 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *args, **kwargs):
         # 创建模型实例
+        print("[DEBUG] LlavaQwenForCausalLM.from_pretrained: calling super().from_pretrained()", flush=True)
         model = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
+        print("[DEBUG] LlavaQwenForCausalLM.from_pretrained: super().from_pretrained() returned", flush=True)
         # 加载自定义权重
         if model.get_spatial_tower() is not None:
+            print("[DEBUG] Loading spatial tower...", flush=True)
             model.get_spatial_tower().is_loaded = False
             model.get_spatial_tower().load_model()
+            print("[DEBUG] Spatial tower loaded, converting to dtype...", flush=True)
             model.get_spatial_tower().is_loaded = True
             model.get_spatial_tower().to(kwargs.get("torch_dtype", torch.float16))
+            print("[DEBUG] Spatial tower dtype conversion done", flush=True)
 
+        print("[DEBUG] LlavaQwenForCausalLM.from_pretrained: returning model", flush=True)
         return model
 
     def get_model(self):

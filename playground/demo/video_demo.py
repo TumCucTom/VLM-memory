@@ -141,9 +141,19 @@ def run_inference(args):
                     overwrite_config["max_sequence_length"] = 4096 * scaling_factor
                     overwrite_config["tokenizer_model_max_length"] = 4096 * scaling_factor
 
-            tokenizer, model, image_processor, context_len = load_pretrained_model(args.model_path, args.model_base, model_name, load_8bit=args.load_8bit, overwrite_config=overwrite_config)
+            # Use sdpa instead of flash_attention_2 to avoid compatibility issues
+            # Flash Attention 2.7.1.post1 may have compatibility issues with this setup
+            tokenizer, model, image_processor, context_len = load_pretrained_model(
+                args.model_path, args.model_base, model_name, 
+                load_8bit=args.load_8bit, overwrite_config=overwrite_config, 
+                attn_implementation="sdpa"
+            )
         else:
-            tokenizer, model, image_processor, context_len = load_pretrained_model(args.model_path, args.model_base, model_name)
+            # Use sdpa instead of flash_attention_2 to avoid compatibility issues
+            tokenizer, model, image_processor, context_len = load_pretrained_model(
+                args.model_path, args.model_base, model_name, 
+                attn_implementation="sdpa"
+            )
     else:
         pass
 

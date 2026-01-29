@@ -81,6 +81,21 @@ git submodule update --init --recursive
 
 ### 2. Environment Setup
 
+**Important for HPC Systems:** If you're on an HPC system with limited home directory quota (e.g., 25GB), use the work/scratch space instead. Set up your environment in `/user/work/$USER`:
+
+```bash
+# Create convenience symlink (if not already exists)
+ln -s /user/work/$USER ~/work
+
+# Create directories in work space
+mkdir -p ~/work/{python-envs,venvs,pip-cache}
+
+# Set pip cache to work space (saves ~5-10GB during installation)
+export PIP_CACHE_DIR=~/work/pip-cache
+```
+
+**For systems without conda or Python 3.10:** You'll need to build Python 3.10 from source in the work space (see instructions below).
+
 1. **Create conda environment:**
 
    ```
@@ -92,7 +107,7 @@ git submodule update --init --recursive
 
    ```
    pip install --upgrade pip
-   conda install pytorch==2.1.1 torchvision==0.16.1 pytorch-cuda=12.1 -c pytorch -c nvidia -y
+   pip install torch==2.1.1 torchvision==0.16.1 --index-url https://download.pytorch.org/whl/cu121
    ```
 
 3. **Install project dependencies:**
@@ -274,7 +289,8 @@ cd thinking-in-space # Ensure you are in the correct directory if it's a submodu
 
 conda create --name vsibench python=3.10 -y
 conda activate vsibench
-conda install pytorch==2.1.1 torchvision==0.16.1 torchaudio==2.1.1 pytorch-cuda=12.1 -c pytorch -c nvidia -y
+pip install --upgrade pip
+pip install torch==2.1.1 torchvision==0.16.1 torchaudio==2.1.1 --index-url https://download.pytorch.org/whl/cu121
 
 pip install -e .
 pip install s2wrapper@git+https://github.com/bfshi/scaling_on_scales
