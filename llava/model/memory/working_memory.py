@@ -63,15 +63,25 @@ class WorkingMemory(nn.Module):
         H_t = H_t.detach().clone()
         
         # Algorithm 1 Line 8: if |W_t| < L_w then
+        was_full = len(buffer) >= self.L_w
+        old_first = buffer[0].clone() if len(buffer) > 0 else None
+        
         if len(buffer) < self.L_w:
             # Algorithm 1 Line 9: W_{t+1} ← W_t ∪ {H_t}
             buffer.append(H_t)
         else:
             # Algorithm 1 Lines 10-13: Remove oldest element (FIFO)
             # Remove first element (oldest)
-            buffer.pop(0)
+            removed_elem = buffer.pop(0)
             # Add new element
             buffer.append(H_t)
+            
+            # DEBUG: Verify FIFO mechanism - oldest element should be removed
+            if old_first is not None:
+                new_first = buffer[0]
+                first_unchanged = torch.allclose(old_first, new_first, atol=1e-5)
+                if first_unchanged:
+                    print(f"[Working Memory DEBUG] FIFO check failed! First element unchanged after update when full.")
         
         self._buffer_size = torch.tensor(len(buffer))
         return buffer

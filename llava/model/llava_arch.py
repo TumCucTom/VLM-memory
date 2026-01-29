@@ -26,6 +26,7 @@ from .multimodal_fusion_block.builder import build_multimodal_fusion_block
 from .multimodal_resampler.builder import build_vision_resampler
 from .multimodal_projector.builder import build_vision_projector
 from .memory.working_memory import WorkingMemory
+from .memory.episodic_memory import EpisodicMemory
 from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 
 from llava.mm_utils import get_anyres_image_grid_shape
@@ -63,6 +64,16 @@ class LlavaMetaModel:
                 L_w=working_memory_size,
                 feature_dim=config.hidden_size
             )
+            # Initialize Episodic Memory (L_e=32 as per paper recommendation)
+            # According to VLM² paper: "episodic memory that consolidates and stores critical long-term information"
+            # Uses gated attention to identify salient information (enabled by default)
+            episodic_memory_size = getattr(config, "episodic_memory_size", 32)
+            use_gated_attention = getattr(config, "episodic_memory_gated_attention", True)
+            self.episodic_memory = EpisodicMemory(
+                L_e=episodic_memory_size,
+                feature_dim=config.hidden_size,
+                use_gated_attention=use_gated_attention
+            )
             # Attention mechanism for working memory retrieval (Algorithm 1 Line 1)
             # Working Attention: Q = H_t, KV = W_t
             num_heads = getattr(config, "num_attention_heads", 8)
@@ -71,6 +82,23 @@ class LlavaMetaModel:
                 num_heads=num_heads,
                 dropout=0.1,
                 batch_first=True
+            )
+            # Attention mechanism for episodic memory retrieval (Algorithm 1 Line 2)
+            # Episodic Attention: Q = H_t, KV = E_t
+            self.episodic_attention = nn.MultiheadAttention(
+                embed_dim=config.hidden_size,
+                num_heads=num_heads,
+                dropout=0.1,
+                batch_first=True
+            )
+            # Fusion MLP for combining working and episodic memory (Algorithm 1 Lines 5-7)
+            # γ_t ← MLP([M_t^w; M_t^e])
+            fusion_hidden_dim = getattr(config, "memory_fusion_hidden_dim", config.hidden_size)
+            self.memory_fusion_mlp = nn.Sequential(
+                nn.Linear(config.hidden_size * 2, fusion_hidden_dim),  # [M_t^w; M_t^e] -> hidden
+                nn.ReLU(),
+                nn.Linear(fusion_hidden_dim, config.hidden_size),  # hidden -> feature_dim
+                nn.Sigmoid()  # Output gate values in [0, 1]
             )
 
             if "unpad" in getattr(config, "mm_patch_merge_type", ""):
@@ -98,11 +126,23 @@ class LlavaMetaModel:
         """Get working memory module"""
         return getattr(self, "working_memory", None)
     
-    def _apply_working_memory(self, H_t: torch.Tensor) -> torch.Tensor:
+    def get_episodic_memory(self):
+        """Get episodic memory module"""
+        return getattr(self, "episodic_memory", None)
+    
+    def _apply_dual_memory(self, H_t: torch.Tensor) -> torch.Tensor:
         """
-        Apply Working Memory to current features (Algorithm 1 Lines 1, 8-14)
+        Apply Dual Memory System (Algorithm 1 from VLM² paper)
         
-        For videos, processes frames individually to maintain temporal working memory.
+        Implements:
+        1. M_t^w ← Working Attention(Q = H_t, KV = W_t)  [Line 1]
+        2. M_t^e ← Episodic Attention(Q = H_t, KV = E_t)  [Line 2]
+        3. γ_t ← MLP([M_t^w; M_t^e])  [Line 5]
+        4. M_t ← γ_t ⊙ M_t^w + (1-γ_t) ⊙ M_t^e  [Lines 6-7]
+        5. Update Working Memory (FIFO)  [Lines 8-14]
+        6. Update Episodic Memory (similarity-based replacement)  [Lines 15-24]
+        
+        For videos, processes frames individually to maintain temporal memory.
         For single images, processes once.
         
         Args:
@@ -114,175 +154,347 @@ class LlavaMetaModel:
                 This is the output from mm_projector (or fusion_block + mm_projector)
         
         Returns:
-            M_t^w: Retrieved features from working memory [B*T, N, D] or [B, N, D]
-                If working memory is empty, returns H_t (no retrieval)
+            M_t: Fused memory output [B*T, N, D] or [B, N, D]
+                If both memories are empty, returns H_t (no retrieval)
         """
         working_memory = self.get_working_memory()
-        if working_memory is None:
+        episodic_memory = self.get_episodic_memory()
+        
+        # If no memory modules, return original features
+        if working_memory is None and episodic_memory is None:
             return H_t
         
         device = H_t.device
-        original_shape = H_t.shape
         
-        # Algorithm 1 Lines 8-14: Update Working Memory with H_t (FIFO)
-        # Process each frame individually to update working memory
-        # H_t is [B*T, N, D] - process each frame in the batch
+        # Process each frame individually for videos
         if H_t.dim() == 3:
             num_frames = H_t.shape[0]
-            # Process frames sequentially: retrieve -> update for each frame
-            M_t_w_list = []
+            M_t_list = []
+            
+            # DEBUG: Log initial memory states
+            if num_frames > 0:
+                w_size = len(working_memory) if working_memory is not None else 0
+                e_size = len(episodic_memory) if episodic_memory is not None else 0
+                rank0_print(f"[DEBUG] Dual Memory System - Starting video processing: "
+                          f"{num_frames} frames, Working Memory: {w_size}/{working_memory.L_w if working_memory else 0}, "
+                          f"Episodic Memory: {e_size}/{episodic_memory.L_e if episodic_memory else 0}")
             
             for frame_idx in range(num_frames):
                 H_t_frame = H_t[frame_idx]  # [N, D]
+                query = H_t_frame.unsqueeze(0)  # [1, N, D] for batch dimension
+                
+                # DEBUG: Log tensor shapes for first frame
+                if frame_idx == 0:
+                    rank0_print(f"[DEBUG] Frame {frame_idx}: Input H_t shape: {H_t_frame.shape}, "
+                              f"query shape: {query.shape}")
                 
                 # Algorithm 1 Line 1: M_t^w ← Working Attention(Q = H_t, KV = W_t)
-                # Check buffer BEFORE updating (retrieve from previous frames)
-                W_t = working_memory.get_buffer()
-                
-                if len(W_t) > 0:
-                    # Debug: Verify attention retrieval is happening
-                    rank0_print(f"[Working Memory] Frame {frame_idx}: ✓ Retrieval from {len(W_t)} memory elements")
-                    
-                    # Prepare query: H_t_frame [N, D]
-                    query = H_t_frame.unsqueeze(0)  # [1, N, D] for batch dimension
-                    
-                    # Prepare key-value from working memory buffer
-                    memory_list = []
-                    for mem_elem in W_t:
-                        mem_elem = mem_elem.to(device)
-                        if mem_elem.dim() > 1:
-                            mem_elem = mem_elem.flatten()
-                        memory_list.append(mem_elem)
-                    
-                    # Stack: [L, D]
-                    W_t_tensor = torch.stack(memory_list, dim=0)  # [L, D]
-                    W_t_tensor = W_t_tensor.unsqueeze(0)  # [1, L, D] for batch dimension
-                    
-                    # Working Attention: Q = H_t_frame [1, N, D], KV = W_t [1, L, D]
-                    M_t_w_frame, attn_weights = self.working_attention(
-                        query=query,  # [1, N, D]
-                        key=W_t_tensor,  # [1, L, D]
-                        value=W_t_tensor  # [1, L, D]
-                    )  # Output: [1, N, D]
-                    
-                    # Debug: Show attention weights to verify retrieval
-                    if attn_weights is not None:
-                        # attn_weights shape: [1, num_heads, N, L] or [1, N, L]
-                        if attn_weights.dim() == 4:
-                            attn_weights = attn_weights.mean(dim=1)  # [1, N, L]
-                        # Average over query positions: [1, N, L] -> [1, L]
-                        attn_per_memory = attn_weights.mean(dim=1).squeeze(0)  # [L]
-                        max_attn_idx = attn_per_memory.argmax().item()
-                        max_attn_val = attn_per_memory.max().item()
-                        rank0_print(f"[Working Memory] Frame {frame_idx}: ✓ Attention active - max on slot {max_attn_idx}/{len(W_t)-1} (weight: {max_attn_val:.4f})")
-                    
-                    # Fuse retrieved memory with current features
-                    M_t_w_frame = M_t_w_frame.squeeze(0) + H_t_frame  # [N, D]
+                M_t_w_frame = None
+                if working_memory is not None:
+                    W_t = working_memory.get_buffer()
+                    if len(W_t) > 0:
+                        rank0_print(f"[Dual Memory] Frame {frame_idx}: Working memory retrieval from {len(W_t)} elements")
+                        
+                        # Prepare key-value from working memory
+                        memory_list = []
+                        for mem_elem in W_t:
+                            mem_elem = mem_elem.to(device)
+                            if mem_elem.dim() > 1:
+                                mem_elem = mem_elem.flatten()
+                            memory_list.append(mem_elem)
+                        
+                        W_t_tensor = torch.stack(memory_list, dim=0).unsqueeze(0)  # [1, L_w, D]
+                        
+                        # DEBUG: Verify attention retrieval is happening
+                        H_t_frame_mean = H_t_frame.mean().item()
+                        
+                        # Working Attention
+                        M_t_w_frame, attn_weights_w = self.working_attention(
+                            query=query,  # [1, N, D]
+                            key=W_t_tensor,  # [1, L_w, D]
+                            value=W_t_tensor  # [1, L_w, D]
+                        )  # Output: [1, N, D]
+                        M_t_w_frame = M_t_w_frame.squeeze(0)  # [N, D]
+                        
+                        # DEBUG: Verify attention retrieval changed the representation
+                        M_t_w_frame_mean = M_t_w_frame.mean().item()
+                        attn_weights_mean = attn_weights_w.mean().item() if attn_weights_w is not None else 0.0
+                        if frame_idx < 3 or frame_idx % 10 == 0:
+                            rank0_print(f"[DEBUG] Frame {frame_idx}: Working attention retrieval - "
+                                      f"H_t mean: {H_t_frame_mean:.4f}, M_t^w mean: {M_t_w_frame_mean:.4f}, "
+                                      f"attn_weights mean: {attn_weights_mean:.4f}")
+                        
+                        # DEBUG: Check that M_t_w is different from H_t (attention is working)
+                        diff_norm = torch.norm(M_t_w_frame - H_t_frame).item()
+                        if diff_norm < 1e-6:
+                            rank0_print(f"[WARNING] Frame {frame_idx}: Working attention output identical to input! "
+                                      f"diff_norm={diff_norm:.6f}")
+                    else:
+                        if frame_idx == 0:
+                            rank0_print(f"[Dual Memory] Frame {frame_idx}: Working memory empty (first frame)")
+                        M_t_w_frame = H_t_frame  # [N, D]
                 else:
-                    # Empty working memory - no retrieval, just pass through
-                    if frame_idx == 0:
-                        rank0_print(f"[Working Memory] Frame {frame_idx}: Empty buffer - no retrieval (first frame)")
                     M_t_w_frame = H_t_frame
                 
-                M_t_w_list.append(M_t_w_frame)
-                
-                # Extract a single representation: mean pool over sequence
-                H_t_for_storage = H_t_frame.mean(dim=0)  # [D]
-                
-                # Get memory state before update
-                old_size = len(working_memory)
-                was_full = working_memory.is_full()
-                
-                # Update working memory (FIFO mechanism) for this frame
-                working_memory.update(H_t_for_storage)
-                
-                # Get memory state after update
-                new_size = len(working_memory)
-                is_full = working_memory.is_full()
-                
-                # Debug: Verify memory updates and FIFO behavior
-                if frame_idx < 5 or was_full or (old_size < working_memory.L_w and new_size == working_memory.L_w):
-                    fifo_info = ""
-                    if was_full and new_size == working_memory.L_w:
-                        fifo_info = " [FIFO: oldest removed, newest added]"
-                    elif old_size < working_memory.L_w and new_size == working_memory.L_w:
-                        fifo_info = " [Memory now FULL - FIFO will activate on next frame]"
-                    elif not was_full and new_size > old_size:
-                        fifo_info = " [Filling memory]"
-                    
-                    rank0_print(f"[Working Memory] Frame {frame_idx}/{num_frames-1}: {old_size} → {new_size} elements (capacity: {working_memory.L_w}){fifo_info}")
-                    
-                    # Verify FIFO: Check if oldest element was removed when full
-                    if was_full and new_size == working_memory.L_w:
-                        # Memory was full, so oldest should have been removed
-                        rank0_print(f"[Working Memory] ✓ FIFO verified: Memory full, oldest frame removed, new frame added")
-            
-            # Stack all processed frames back together
-            M_t_w = torch.stack(M_t_w_list, dim=0)  # [B*T, N, D]
-        else:
-            # Single frame or already 1D - process similarly
-            W_t = working_memory.get_buffer()
-            
-            if len(W_t) > 0:
-                # Debug: Verify attention retrieval is happening
-                rank0_print(f"[Working Memory] Single frame: ✓ Retrieval from {len(W_t)} memory elements")
-                
-                # Prepare query
-                if H_t.dim() == 2:
-                    query = H_t.unsqueeze(0)  # [1, N, D]
-                elif H_t.dim() == 1:
-                    query = H_t.unsqueeze(0).unsqueeze(0)  # [1, 1, D]
+                # Algorithm 1 Line 2: M_t^e ← Episodic Attention(Q = H_t, KV = E_t)
+                M_t_e_frame = None
+                if episodic_memory is not None:
+                    E_t = episodic_memory.get_buffer()
+                    if len(E_t) > 0:
+                        rank0_print(f"[Dual Memory] Frame {frame_idx}: Episodic memory retrieval from {len(E_t)} elements")
+                        
+                        # Prepare key-value from episodic memory
+                        memory_list = []
+                        for mem_elem in E_t:
+                            mem_elem = mem_elem.to(device)
+                            if mem_elem.dim() > 1:
+                                mem_elem = mem_elem.flatten()
+                            memory_list.append(mem_elem)
+                        
+                        E_t_tensor = torch.stack(memory_list, dim=0).unsqueeze(0)  # [1, L_e, D]
+                        
+                        # DEBUG: Verify attention retrieval is happening
+                        H_t_frame_mean_before = H_t_frame.mean().item()
+                        
+                        # Episodic Attention
+                        M_t_e_frame, attn_weights_e = self.episodic_attention(
+                            query=query,  # [1, N, D]
+                            key=E_t_tensor,  # [1, L_e, D]
+                            value=E_t_tensor  # [1, L_e, D]
+                        )  # Output: [1, N, D]
+                        M_t_e_frame = M_t_e_frame.squeeze(0)  # [N, D]
+                        
+                        # DEBUG: Verify attention retrieval changed the representation
+                        M_t_e_frame_mean = M_t_e_frame.mean().item()
+                        attn_weights_e_mean = attn_weights_e.mean().item() if attn_weights_e is not None else 0.0
+                        if frame_idx < 3 or frame_idx % 10 == 0:
+                            rank0_print(f"[DEBUG] Frame {frame_idx}: Episodic attention retrieval - "
+                                      f"H_t mean: {H_t_frame_mean_before:.4f}, M_t^e mean: {M_t_e_frame_mean:.4f}, "
+                                      f"attn_weights mean: {attn_weights_e_mean:.4f}")
+                        
+                        # DEBUG: Check that M_t_e is different from H_t (attention is working)
+                        diff_norm = torch.norm(M_t_e_frame - H_t_frame).item()
+                        if diff_norm < 1e-6:
+                            rank0_print(f"[WARNING] Frame {frame_idx}: Episodic attention output identical to input! "
+                                      f"diff_norm={diff_norm:.6f}")
+                    else:
+                        if frame_idx == 0:
+                            rank0_print(f"[Dual Memory] Frame {frame_idx}: Episodic memory empty (first frame)")
+                        M_t_e_frame = H_t_frame  # [N, D]
                 else:
-                    query = H_t
+                    M_t_e_frame = H_t_frame
                 
-                # Prepare key-value from working memory buffer
-                memory_list = []
-                for mem_elem in W_t:
-                    mem_elem = mem_elem.to(device)
-                    if mem_elem.dim() > 1:
-                        mem_elem = mem_elem.flatten()
-                    memory_list.append(mem_elem)
+                # Algorithm 1 Lines 5-7: Gated Memory Fusion
+                # γ_t = σ(MLP(Concat[M_t^w; M_t^e]))
+                # M_t = γ_t ⊙ M_t^w + (1-γ_t) ⊙ M_t^e
+                # Concatenate along feature dimension: [N, D] + [N, D] -> [N, 2*D]
+                M_concat = torch.cat([M_t_w_frame, M_t_e_frame], dim=-1)  # [N, 2*D]
                 
-                W_t_tensor = torch.stack(memory_list, dim=0).unsqueeze(0)  # [1, L, D]
+                # Compute gate: [N, 2*D] -> [N, D]
+                gamma_t = self.memory_fusion_mlp(M_concat)  # [N, D]
                 
-                # Working Attention
-                M_t_w, attn_weights = self.working_attention(
-                    query=query,
-                    key=W_t_tensor,
-                    value=W_t_tensor
-                )
+                # DEBUG: Verify gate values are in [0, 1] and vary
+                gamma_min = gamma_t.min().item()
+                gamma_max = gamma_t.max().item()
+                gamma_mean = gamma_t.mean().item()
+                gamma_std = gamma_t.std().item()
+                if frame_idx < 3 or frame_idx % 10 == 0:
+                    rank0_print(f"[DEBUG] Frame {frame_idx}: Memory fusion gate γ_t - "
+                              f"min: {gamma_min:.4f}, max: {gamma_max:.4f}, "
+                              f"mean: {gamma_mean:.4f}, std: {gamma_std:.4f}")
                 
-                # Debug: Show attention weights
-                if attn_weights is not None:
-                    if attn_weights.dim() == 4:
-                        attn_weights = attn_weights.mean(dim=1)
-                    attn_per_memory = attn_weights.mean(dim=1).squeeze(0)
-                    max_attn_idx = attn_per_memory.argmax().item()
-                    max_attn_val = attn_per_memory.max().item()
-                    rank0_print(f"[Working Memory] Single frame: ✓ Attention active - max on slot {max_attn_idx}/{len(W_t)-1} (weight: {max_attn_val:.4f})")
+                # Verify gate is in valid range [0, 1]
+                if gamma_min < -0.01 or gamma_max > 1.01:
+                    rank0_print(f"[WARNING] Frame {frame_idx}: Gate values out of [0,1] range! "
+                              f"min: {gamma_min:.4f}, max: {gamma_max:.4f}")
                 
-                # Fuse with residual
-                if M_t_w.dim() > H_t.dim():
-                    M_t_w = M_t_w.squeeze(0)
-                M_t_w = M_t_w + H_t
+                # Fused output (Algorithm 1 Line 7): [N, D]
+                M_t_frame = gamma_t * M_t_w_frame + (1 - gamma_t) * M_t_e_frame
+                
+                # DEBUG: Verify fusion produces different output
+                M_t_frame_mean = M_t_frame.mean().item()
+                if frame_idx < 3 or frame_idx % 10 == 0:
+                    rank0_print(f"[DEBUG] Frame {frame_idx}: Fused memory M_t mean: {M_t_frame_mean:.4f}")
+                
+                M_t_list.append(M_t_frame)
+                
+                # Extract representations for storage: mean pool over sequence
+                H_t_for_storage = H_t_frame.mean(dim=0)  # [D] - for working memory
+                M_t_for_storage = M_t_frame.mean(dim=0)  # [D] - for episodic memory (fused memory)
+                
+                # Algorithm 1 Lines 8-14: Update Working Memory (FIFO)
+                # Working memory uses H_t (raw input features)
+                if working_memory is not None:
+                    old_w_size = len(working_memory)
+                    old_w_buffer = working_memory.get_buffer().copy() if old_w_size > 0 else []
+                    old_w_first = old_w_buffer[0].clone() if len(old_w_buffer) > 0 else None
+                    
+                    working_memory.update(H_t_for_storage)
+                    new_w_size = len(working_memory)
+                    new_w_buffer = working_memory.get_buffer()
+                    new_w_first = new_w_buffer[0].clone() if len(new_w_buffer) > 0 else None
+                    
+                    # DEBUG: Verify FIFO mechanism (oldest removed when full)
+                    if old_w_size >= working_memory.L_w and new_w_size == working_memory.L_w:
+                        # Memory was full, should have removed oldest
+                        if old_w_first is not None and new_w_first is not None:
+                            first_unchanged = torch.allclose(old_w_first, new_w_first, atol=1e-5)
+                            if first_unchanged:
+                                rank0_print(f"[WARNING] Frame {frame_idx}: Working memory FIFO check failed! "
+                                          f"First element unchanged after update when memory was full.")
+                            elif frame_idx < 3 or frame_idx % 10 == 0:
+                                rank0_print(f"[DEBUG] Frame {frame_idx}: Working memory FIFO verified - "
+                                          f"oldest element removed (first element changed)")
+                    
+                    if frame_idx < 3 or old_w_size != new_w_size:
+                        rank0_print(f"[Dual Memory] Frame {frame_idx}: Working memory {old_w_size} → {new_w_size} "
+                                  f"(capacity: {working_memory.L_w}, is_full: {working_memory.is_full()})")
+                
+                # Algorithm 1 Lines 15-24: Update Episodic Memory (similarity-based replacement)
+                # Episodic memory uses M_t (fused memory-enhanced representation)
+                # According to Algorithm 1: E_{t+1} ← E_t ∪ {M_t} (Line 16) or E_{t+1}[j*] ← M_t (Line 19)
+                if episodic_memory is not None:
+                    old_e_size = len(episodic_memory)
+                    old_e_buffer = episodic_memory.get_buffer().copy() if old_e_size > 0 else []
+                    
+                    # DEBUG: Store buffer state before update for similarity check
+                    if old_e_size >= episodic_memory.L_e:
+                        # Memory is full, will use similarity-based replacement
+                        # Compute similarities with all elements to predict which will be replaced
+                        similarities_before = []
+                        for mem_elem in old_e_buffer:
+                            sim = episodic_memory._compute_similarity(M_t_for_storage, mem_elem)
+                            similarities_before.append(sim)
+                        predicted_replace_idx = max(range(len(similarities_before)), 
+                                                   key=lambda i: similarities_before[i])
+                        predicted_sim = similarities_before[predicted_replace_idx]
+                        if frame_idx < 3 or frame_idx % 10 == 0:
+                            rank0_print(f"[DEBUG] Frame {frame_idx}: Episodic memory full - "
+                                      f"predicted replacement at idx {predicted_replace_idx} "
+                                      f"(similarity: {predicted_sim:.4f})")
+                    
+                    episodic_memory.update(M_t_for_storage)  # Use M_t, not H_t!
+                    new_e_size = len(episodic_memory)
+                    new_e_buffer = episodic_memory.get_buffer()
+                    
+                    # DEBUG: Verify similarity-based replacement when full
+                    if old_e_size >= episodic_memory.L_e and new_e_size == episodic_memory.L_e:
+                        # Memory was full, should have replaced most similar element
+                        if len(old_e_buffer) > 0 and len(new_e_buffer) > 0:
+                            # Check which element changed
+                            changed_indices = []
+                            for i, (old_elem, new_elem) in enumerate(zip(old_e_buffer, new_e_buffer)):
+                                if not torch.allclose(old_elem, new_elem, atol=1e-5):
+                                    changed_indices.append(i)
+                            
+                            if len(changed_indices) == 1:
+                                actual_replace_idx = changed_indices[0]
+                                if actual_replace_idx == predicted_replace_idx:
+                                    if frame_idx < 3 or frame_idx % 10 == 0:
+                                        rank0_print(f"[DEBUG] Frame {frame_idx}: Episodic memory similarity-based "
+                                                  f"replacement verified - replaced idx {actual_replace_idx} "
+                                                  f"(most similar, sim={predicted_sim:.4f})")
+                                else:
+                                    rank0_print(f"[WARNING] Frame {frame_idx}: Episodic memory replacement mismatch! "
+                                              f"Predicted idx {predicted_replace_idx}, actual idx {actual_replace_idx}")
+                            elif len(changed_indices) == 0:
+                                rank0_print(f"[WARNING] Frame {frame_idx}: Episodic memory no replacement when full!")
+                            else:
+                                rank0_print(f"[WARNING] Frame {frame_idx}: Episodic memory multiple elements changed: "
+                                          f"{changed_indices}")
+                    
+                    if frame_idx < 3 or old_e_size != new_e_size:
+                        rank0_print(f"[Dual Memory] Frame {frame_idx}: Episodic memory {old_e_size} → {new_e_size} "
+                                  f"(capacity: {episodic_memory.L_e}, is_full: {episodic_memory.is_full()})")
+            
+            # Stack all processed frames
+            M_t = torch.stack(M_t_list, dim=0)  # [B*T, N, D]
+            
+            # DEBUG: Log final memory states after video processing
+            w_size_final = len(working_memory) if working_memory is not None else 0
+            e_size_final = len(episodic_memory) if episodic_memory is not None else 0
+            rank0_print(f"[DEBUG] Dual Memory System - Completed video processing: "
+                      f"Working Memory: {w_size_final}/{working_memory.L_w if working_memory else 0}, "
+                      f"Episodic Memory: {e_size_final}/{episodic_memory.L_e if episodic_memory else 0}, "
+                      f"Output M_t shape: {M_t.shape}")
+        else:
+            # Single frame processing
+            query = H_t.unsqueeze(0) if H_t.dim() == 2 else H_t.unsqueeze(0).unsqueeze(0)  # [1, N, D] or [1, 1, D]
+            
+            # Working memory retrieval
+            M_t_w = None
+            if working_memory is not None:
+                W_t = working_memory.get_buffer()
+                if len(W_t) > 0:
+                    memory_list = [mem_elem.to(device).flatten() if mem_elem.dim() > 1 else mem_elem.to(device) 
+                                  for mem_elem in W_t]
+                    W_t_tensor = torch.stack(memory_list, dim=0).unsqueeze(0)  # [1, L_w, D]
+                    M_t_w, _ = self.working_attention(query=query, key=W_t_tensor, value=W_t_tensor)
+                    M_t_w = M_t_w.squeeze(0) if M_t_w.dim() > H_t.dim() else M_t_w
+                else:
+                    M_t_w = H_t
             else:
-                rank0_print(f"[Working Memory] Single frame: Empty buffer - no retrieval")
                 M_t_w = H_t
             
-            # Update working memory
-            if H_t.dim() > 1:
-                H_t_for_storage = H_t.mean(dim=0) if H_t.dim() == 2 else H_t.flatten()
+            # Episodic memory retrieval
+            M_t_e = None
+            if episodic_memory is not None:
+                E_t = episodic_memory.get_buffer()
+                if len(E_t) > 0:
+                    memory_list = [mem_elem.to(device).flatten() if mem_elem.dim() > 1 else mem_elem.to(device) 
+                                  for mem_elem in E_t]
+                    E_t_tensor = torch.stack(memory_list, dim=0).unsqueeze(0)  # [1, L_e, D]
+                    M_t_e, _ = self.episodic_attention(query=query, key=E_t_tensor, value=E_t_tensor)
+                    M_t_e = M_t_e.squeeze(0) if M_t_e.dim() > H_t.dim() else M_t_e
+                else:
+                    M_t_e = H_t
             else:
-                H_t_for_storage = H_t
-            working_memory.update(H_t_for_storage)
+                M_t_e = H_t
+            
+            # Algorithm 1 Lines 5-7: Gated Memory Fusion
+            # γ_t = σ(MLP(Concat[M_t^w; M_t^e]))
+            # M_t = γ_t ⊙ M_t^w + (1-γ_t) ⊙ M_t^e
+            M_concat = torch.cat([M_t_w, M_t_e], dim=-1)
+            gamma_t = self.memory_fusion_mlp(M_concat)
+            M_t = gamma_t * M_t_w + (1 - gamma_t) * M_t_e  # No residual connection per Algorithm 1
+            
+            # Extract representations for storage
+            H_t_for_storage = H_t.mean(dim=0) if H_t.dim() == 2 else H_t.flatten()  # For working memory
+            M_t_for_storage = M_t.mean(dim=0) if M_t.dim() == 2 else M_t.flatten()  # For episodic memory
+            
+            # Algorithm 1 Lines 8-14: Update Working Memory (FIFO) with H_t
+            if working_memory is not None:
+                working_memory.update(H_t_for_storage)
+            
+            # Algorithm 1 Lines 15-24: Update Episodic Memory (similarity-based) with M_t
+            if episodic_memory is not None:
+                episodic_memory.update(M_t_for_storage)  # Use M_t, not H_t!
         
-        return M_t_w
+        return M_t
+    
+    def _apply_working_memory(self, H_t: torch.Tensor) -> torch.Tensor:
+        """
+        Legacy method for backward compatibility.
+        Now calls _apply_dual_memory.
+        """
+        return self._apply_dual_memory(H_t)
     
     def clear_working_memory(self):
         """Clear working memory buffer (call at video boundaries)"""
         working_memory = self.get_working_memory()
         if working_memory is not None:
             working_memory.clear()
+    
+    def clear_episodic_memory(self):
+        """Clear episodic memory buffer (call at video boundaries)"""
+        episodic_memory = self.get_episodic_memory()
+        if episodic_memory is not None:
+            episodic_memory.clear()
+    
+    def clear_all_memory(self):
+        """Clear both working and episodic memory (call at video boundaries)"""
+        self.clear_working_memory()
+        self.clear_episodic_memory()
 
     def initialize_spatial_tower(self, model_args, fsdp=None):
         spatial_tower = model_args.spatial_tower
@@ -453,6 +665,14 @@ class LlavaMetaForCausalLM(ABC):
     def clear_working_memory(self):
         """Clear working memory buffer (call at video boundaries)"""
         return self.get_model().clear_working_memory()
+    
+    def clear_episodic_memory(self):
+        """Clear episodic memory buffer (call at video boundaries)"""
+        return self.get_model().clear_episodic_memory()
+    
+    def clear_all_memory(self):
+        """Clear both working and episodic memory buffers (call at video boundaries)"""
+        return self.get_model().clear_all_memory()
 
     def get_2dPool(self, image_feature, stride=2):
         height = width = self.get_vision_tower().num_patches_per_side
@@ -589,9 +809,10 @@ class LlavaMetaForCausalLM(ABC):
         # Apply Working Memory (Algorithm 1 Lines 1, 8-14)
         # H_t = image_features (current frame features after projection)
         # Retrieve from working memory and update
-        # Call through get_model() since _apply_working_memory is in LlavaMetaModel
-        if self.get_working_memory() is not None:
-            image_features = self.get_model()._apply_working_memory(image_features)
+        # Call through get_model() since _apply_dual_memory is in LlavaMetaModel
+        if (self.get_model().get_working_memory() is not None or 
+            self.get_model().get_episodic_memory() is not None):
+            image_features = self.get_model()._apply_dual_memory(image_features)
         
         return image_features
     
