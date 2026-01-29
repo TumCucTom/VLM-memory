@@ -199,6 +199,9 @@ def run_inference(args):
 
     # import pdb;pdb.set_trace()
     for video_path in all_video_pathes:
+        # Clear working memory at the start of each video for clean state
+        if hasattr(model, 'clear_working_memory'):
+            model.clear_working_memory()
 
         sample_set = {}
         question = args.prompt

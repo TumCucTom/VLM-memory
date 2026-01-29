@@ -25,6 +25,7 @@ from .multimodal_spatial_encoder.builder import build_spatial_tower
 from .multimodal_fusion_block.builder import build_multimodal_fusion_block
 from .multimodal_resampler.builder import build_vision_resampler
 from .multimodal_projector.builder import build_vision_projector
+from .memory.working_memory import WorkingMemory
 from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 
 from llava.mm_utils import get_anyres_image_grid_shape
@@ -55,6 +56,23 @@ class LlavaMetaModel:
             self.vision_resampler = build_vision_resampler(config, vision_tower=self.vision_tower)
             self.mm_projector = build_vision_projector(config, vision_cfg=self.vision_tower.config)
 
+            # Initialize Working Memory (L_w=8 as per paper recommendation)
+            # Working memory processes features after mm_projector, so feature_dim = hidden_size
+            working_memory_size = getattr(config, "working_memory_size", 8)
+            self.working_memory = WorkingMemory(
+                L_w=working_memory_size,
+                feature_dim=config.hidden_size
+            )
+            # Attention mechanism for working memory retrieval (Algorithm 1 Line 1)
+            # Working Attention: Q = H_t, KV = W_t
+            num_heads = getattr(config, "num_attention_heads", 8)
+            self.working_attention = nn.MultiheadAttention(
+                embed_dim=config.hidden_size,
+                num_heads=num_heads,
+                dropout=0.1,
+                batch_first=True
+            )
+
             if "unpad" in getattr(config, "mm_patch_merge_type", ""):
                 self.image_newline = nn.Parameter(torch.empty(config.hidden_size, dtype=self.dtype))
 
@@ -75,6 +93,196 @@ class LlavaMetaModel:
         if type(fusion_block) is list:
             fusion_block = fusion_block[0]
         return fusion_block
+
+    def get_working_memory(self):
+        """Get working memory module"""
+        return getattr(self, "working_memory", None)
+    
+    def _apply_working_memory(self, H_t: torch.Tensor) -> torch.Tensor:
+        """
+        Apply Working Memory to current features (Algorithm 1 Lines 1, 8-14)
+        
+        For videos, processes frames individually to maintain temporal working memory.
+        For single images, processes once.
+        
+        Args:
+            H_t: Current input features [B*T, N, D] or [B, N, D] where:
+                - B is batch size
+                - T is number of frames (1 for images, >1 for videos)
+                - N is sequence length (patches)
+                - D is hidden_size
+                This is the output from mm_projector (or fusion_block + mm_projector)
+        
+        Returns:
+            M_t^w: Retrieved features from working memory [B*T, N, D] or [B, N, D]
+                If working memory is empty, returns H_t (no retrieval)
+        """
+        working_memory = self.get_working_memory()
+        if working_memory is None:
+            return H_t
+        
+        device = H_t.device
+        original_shape = H_t.shape
+        
+        # Algorithm 1 Lines 8-14: Update Working Memory with H_t (FIFO)
+        # Process each frame individually to update working memory
+        # H_t is [B*T, N, D] - process each frame in the batch
+        if H_t.dim() == 3:
+            num_frames = H_t.shape[0]
+            # Process frames sequentially: retrieve -> update for each frame
+            M_t_w_list = []
+            
+            for frame_idx in range(num_frames):
+                H_t_frame = H_t[frame_idx]  # [N, D]
+                
+                # Algorithm 1 Line 1: M_t^w ← Working Attention(Q = H_t, KV = W_t)
+                # Check buffer BEFORE updating (retrieve from previous frames)
+                W_t = working_memory.get_buffer()
+                
+                if len(W_t) > 0:
+                    # Debug: Verify attention retrieval is happening
+                    rank0_print(f"[Working Memory] Frame {frame_idx}: ✓ Retrieval from {len(W_t)} memory elements")
+                    
+                    # Prepare query: H_t_frame [N, D]
+                    query = H_t_frame.unsqueeze(0)  # [1, N, D] for batch dimension
+                    
+                    # Prepare key-value from working memory buffer
+                    memory_list = []
+                    for mem_elem in W_t:
+                        mem_elem = mem_elem.to(device)
+                        if mem_elem.dim() > 1:
+                            mem_elem = mem_elem.flatten()
+                        memory_list.append(mem_elem)
+                    
+                    # Stack: [L, D]
+                    W_t_tensor = torch.stack(memory_list, dim=0)  # [L, D]
+                    W_t_tensor = W_t_tensor.unsqueeze(0)  # [1, L, D] for batch dimension
+                    
+                    # Working Attention: Q = H_t_frame [1, N, D], KV = W_t [1, L, D]
+                    M_t_w_frame, attn_weights = self.working_attention(
+                        query=query,  # [1, N, D]
+                        key=W_t_tensor,  # [1, L, D]
+                        value=W_t_tensor  # [1, L, D]
+                    )  # Output: [1, N, D]
+                    
+                    # Debug: Show attention weights to verify retrieval
+                    if attn_weights is not None:
+                        # attn_weights shape: [1, num_heads, N, L] or [1, N, L]
+                        if attn_weights.dim() == 4:
+                            attn_weights = attn_weights.mean(dim=1)  # [1, N, L]
+                        # Average over query positions: [1, N, L] -> [1, L]
+                        attn_per_memory = attn_weights.mean(dim=1).squeeze(0)  # [L]
+                        max_attn_idx = attn_per_memory.argmax().item()
+                        max_attn_val = attn_per_memory.max().item()
+                        rank0_print(f"[Working Memory] Frame {frame_idx}: ✓ Attention active - max on slot {max_attn_idx}/{len(W_t)-1} (weight: {max_attn_val:.4f})")
+                    
+                    # Fuse retrieved memory with current features
+                    M_t_w_frame = M_t_w_frame.squeeze(0) + H_t_frame  # [N, D]
+                else:
+                    # Empty working memory - no retrieval, just pass through
+                    if frame_idx == 0:
+                        rank0_print(f"[Working Memory] Frame {frame_idx}: Empty buffer - no retrieval (first frame)")
+                    M_t_w_frame = H_t_frame
+                
+                M_t_w_list.append(M_t_w_frame)
+                
+                # Extract a single representation: mean pool over sequence
+                H_t_for_storage = H_t_frame.mean(dim=0)  # [D]
+                
+                # Get memory state before update
+                old_size = len(working_memory)
+                was_full = working_memory.is_full()
+                
+                # Update working memory (FIFO mechanism) for this frame
+                working_memory.update(H_t_for_storage)
+                
+                # Get memory state after update
+                new_size = len(working_memory)
+                is_full = working_memory.is_full()
+                
+                # Debug: Verify memory updates and FIFO behavior
+                if frame_idx < 5 or was_full or (old_size < working_memory.L_w and new_size == working_memory.L_w):
+                    fifo_info = ""
+                    if was_full and new_size == working_memory.L_w:
+                        fifo_info = " [FIFO: oldest removed, newest added]"
+                    elif old_size < working_memory.L_w and new_size == working_memory.L_w:
+                        fifo_info = " [Memory now FULL - FIFO will activate on next frame]"
+                    elif not was_full and new_size > old_size:
+                        fifo_info = " [Filling memory]"
+                    
+                    rank0_print(f"[Working Memory] Frame {frame_idx}/{num_frames-1}: {old_size} → {new_size} elements (capacity: {working_memory.L_w}){fifo_info}")
+                    
+                    # Verify FIFO: Check if oldest element was removed when full
+                    if was_full and new_size == working_memory.L_w:
+                        # Memory was full, so oldest should have been removed
+                        rank0_print(f"[Working Memory] ✓ FIFO verified: Memory full, oldest frame removed, new frame added")
+            
+            # Stack all processed frames back together
+            M_t_w = torch.stack(M_t_w_list, dim=0)  # [B*T, N, D]
+        else:
+            # Single frame or already 1D - process similarly
+            W_t = working_memory.get_buffer()
+            
+            if len(W_t) > 0:
+                # Debug: Verify attention retrieval is happening
+                rank0_print(f"[Working Memory] Single frame: ✓ Retrieval from {len(W_t)} memory elements")
+                
+                # Prepare query
+                if H_t.dim() == 2:
+                    query = H_t.unsqueeze(0)  # [1, N, D]
+                elif H_t.dim() == 1:
+                    query = H_t.unsqueeze(0).unsqueeze(0)  # [1, 1, D]
+                else:
+                    query = H_t
+                
+                # Prepare key-value from working memory buffer
+                memory_list = []
+                for mem_elem in W_t:
+                    mem_elem = mem_elem.to(device)
+                    if mem_elem.dim() > 1:
+                        mem_elem = mem_elem.flatten()
+                    memory_list.append(mem_elem)
+                
+                W_t_tensor = torch.stack(memory_list, dim=0).unsqueeze(0)  # [1, L, D]
+                
+                # Working Attention
+                M_t_w, attn_weights = self.working_attention(
+                    query=query,
+                    key=W_t_tensor,
+                    value=W_t_tensor
+                )
+                
+                # Debug: Show attention weights
+                if attn_weights is not None:
+                    if attn_weights.dim() == 4:
+                        attn_weights = attn_weights.mean(dim=1)
+                    attn_per_memory = attn_weights.mean(dim=1).squeeze(0)
+                    max_attn_idx = attn_per_memory.argmax().item()
+                    max_attn_val = attn_per_memory.max().item()
+                    rank0_print(f"[Working Memory] Single frame: ✓ Attention active - max on slot {max_attn_idx}/{len(W_t)-1} (weight: {max_attn_val:.4f})")
+                
+                # Fuse with residual
+                if M_t_w.dim() > H_t.dim():
+                    M_t_w = M_t_w.squeeze(0)
+                M_t_w = M_t_w + H_t
+            else:
+                rank0_print(f"[Working Memory] Single frame: Empty buffer - no retrieval")
+                M_t_w = H_t
+            
+            # Update working memory
+            if H_t.dim() > 1:
+                H_t_for_storage = H_t.mean(dim=0) if H_t.dim() == 2 else H_t.flatten()
+            else:
+                H_t_for_storage = H_t
+            working_memory.update(H_t_for_storage)
+        
+        return M_t_w
+    
+    def clear_working_memory(self):
+        """Clear working memory buffer (call at video boundaries)"""
+        working_memory = self.get_working_memory()
+        if working_memory is not None:
+            working_memory.clear()
 
     def initialize_spatial_tower(self, model_args, fsdp=None):
         spatial_tower = model_args.spatial_tower
@@ -238,6 +446,14 @@ class LlavaMetaForCausalLM(ABC):
     def get_fusion_block(self):
         return self.get_model().get_fusion_block()
 
+    def get_working_memory(self):
+        """Get working memory module"""
+        return self.get_model().get_working_memory()
+    
+    def clear_working_memory(self):
+        """Clear working memory buffer (call at video boundaries)"""
+        return self.get_model().clear_working_memory()
+
     def get_2dPool(self, image_feature, stride=2):
         height = width = self.get_vision_tower().num_patches_per_side
         num_frames, num_tokens, num_dim = image_feature.shape
@@ -369,6 +585,14 @@ class LlavaMetaForCausalLM(ABC):
 
         else:
             image_features = self.get_model().mm_projector(image_features)
+        
+        # Apply Working Memory (Algorithm 1 Lines 1, 8-14)
+        # H_t = image_features (current frame features after projection)
+        # Retrieve from working memory and update
+        # Call through get_model() since _apply_working_memory is in LlavaMetaModel
+        if self.get_working_memory() is not None:
+            image_features = self.get_model()._apply_working_memory(image_features)
+        
         return image_features
     
     def encode_multimodals(self, videos_or_images, video_idx_in_batch, split_sizes=None):

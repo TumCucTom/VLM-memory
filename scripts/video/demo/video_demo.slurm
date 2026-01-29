@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=vlm3r_video_demo
-#SBATCH --output=logs/video_demo_%j.out
-#SBATCH --error=logs/video_demo_%j.err
+#SBATCH --output=logs/video_demo_memory_%j.out
+#SBATCH --error=logs/video_demo_memory_%j.err
 #SBATCH --time=04:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
