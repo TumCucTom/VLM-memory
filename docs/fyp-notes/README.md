@@ -65,8 +65,62 @@ Updated scripts:
   - Per-frame processing for video sequences
   - Correct update mechanisms: Working memory uses H_t, Episodic memory uses M_t
 
+## Implementation Choices (Not Specified in Paper):
+
+The VLM² paper specifies the mathematical formulation but does not provide exact MLP architectures. Our implementation uses:
+
+**What Makes It "Gated"?**
+The "gated" terminology refers to the MLP's **output acting as a gate** that controls information flow, not internal gates within the MLP itself. The MLP is a standard feedforward network that outputs gate values (via sigmoid activation), which are then used to:
+- **Weight information** (memory fusion): Gate value γ_t controls the weighted combination of working and episodic memory
+- **Filter information** (salience gate): Gate value determines whether information passes through to episodic memory
+
+This is different from "gated architectures" like GRU/LSTM which have internal gates (forget gate, input gate, etc.).
+
+1. **Memory Fusion MLP** (`llava/model/llava_arch.py`, lines 97-102):
+   - Architecture: 2-layer MLP with ReLU activation
+   - Input: Concatenated [M_t^w; M_t^e] → [2*D]
+   - Hidden dimension: `config.hidden_size` (default) or `memory_fusion_hidden_dim` if specified
+   - Output: Gate values γ_t in [0, 1] via Sigmoid
+   - Structure: Linear(2*D → hidden_dim) → ReLU → Linear(hidden_dim → D) → Sigmoid
+   - **How it gates**: The output γ_t is used as a weight: `M_t = γ_t ⊙ M_t^w + (1-γ_t) ⊙ M_t^e` (line 312 in code)
+   - Matches paper equation: γ_t = σ(MLP(Concat[M_t^w; M_t^e]))
+
+```
+self.memory_fusion_mlp = nn.Sequential(
+    nn.Linear(config.hidden_size * 2, fusion_hidden_dim),  # Input: [M_t^w; M_t^e]
+    nn.ReLU(),
+    nn.Linear(fusion_hidden_dim, config.hidden_size),  # Output: gate values
+    nn.Sigmoid()  # Gate in [0, 1]
+)
+```
+
+2. **Salience Gate MLP** (`llava/model/memory/episodic_memory.py`, lines 41-46):
+   - Architecture: 2-layer MLP with ReLU activation
+   - Input: Feature vector H_t → [D]
+   - Hidden dimension: `feature_dim // 2`
+   - Output: Single scalar salience score in [0, 1] via Sigmoid
+   - Structure: Linear(D → D/2) → ReLU → Linear(D/2 → 1) → Sigmoid
+   - **How it gates**: The output salience score is compared to a threshold (default 0.5); if below threshold, information is filtered out (not stored in episodic memory) - see lines 152-155 in code
+   - Purpose: Filters which information is "critical" enough for episodic memory storage
+   - Can be disabled via `use_gated_attention=False` in config
+
+```
+self.salience_gate = nn.Sequential(
+    nn.Linear(feature_dim, feature_dim // 2),
+    nn.ReLU(),
+    nn.Linear(feature_dim // 2, 1),
+    nn.Sigmoid()  # Output: salience score in [0, 1]
+)
+``
+
+These choices follow common MLP design patterns and are consistent with the paper's mathematical formulation.
+
 Testing:
 - Run inference using demo script: `bash scripts/video/demo/video_demo.slurm`
 - Memory clearing happens automatically at video boundaries
 
 - Remove salience gate and increased number of sampled franes to checked episodic memory replacing
+
+# Training
+
+See [here](../vlm2-conversion/TRAINING_DUAL_MEMORY.md)
