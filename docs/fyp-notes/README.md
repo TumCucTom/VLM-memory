@@ -68,3 +68,5 @@ Updated scripts:
 Testing:
 - Run inference using demo script: `bash scripts/video/demo/video_demo.slurm`
 - Memory clearing happens automatically at video boundaries
+
+- Remove salience gate and increased number of sampled franes to checked episodic memory replacing

@@ -57,7 +57,7 @@ export IDX=1
 
 bash scripts/video/demo/video_demo.sh \
     Journey9ni/vlm-3r-llava-qwen2-lora \
-    qwen_1_5 32 2 average grid True \
+    qwen_1_5 64 2 average grid True \
     playground/demo/47334096.mp4 \
     lmms-lab/LLaVA-NeXT-Video-7B-Qwen2
 

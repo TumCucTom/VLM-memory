@@ -65,6 +65,8 @@ def parse_args():
     parser.add_argument("--mm_newline_position", type=str, default="no_token")
     parser.add_argument("--force_sample", type=lambda x: (str(x).lower() == 'true'), default=False)
     parser.add_argument("--add_time_instruction", type=str, default=False)
+    parser.add_argument("--disable_salience_gate", type=lambda x: (str(x).lower() == 'true'), default=False,
+                        help="Disable salience gate in episodic memory (store all frames)")
     return parser.parse_args()
 
 def load_video(video_path,args):
@@ -122,6 +124,8 @@ def run_inference(args):
             overwrite_config["mm_spatial_pool_mode"] = args.mm_spatial_pool_mode
             overwrite_config["mm_spatial_pool_stride"] = args.mm_spatial_pool_stride
             overwrite_config["mm_newline_position"] = args.mm_newline_position
+            if args.disable_salience_gate:
+                overwrite_config["episodic_memory_gated_attention"] = False
 
             cfg_pretrained = AutoConfig.from_pretrained(args.model_path)
 
