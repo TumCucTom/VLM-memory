@@ -111,7 +111,7 @@ self.salience_gate = nn.Sequential(
     nn.Linear(feature_dim // 2, 1),
     nn.Sigmoid()  # Output: salience score in [0, 1]
 )
-``
+```
 
 These choices follow common MLP design patterns and are consistent with the paper's mathematical formulation.
 
@@ -123,4 +123,45 @@ Testing:
 
 # Training
 
-See [here](../vlm2-conversion/TRAINING_DUAL_MEMORY.md)
+See the guide [here](../vlm2-conversion/TRAINING_DUAL_MEMORY.md)
+
+## Phase 1 Training Setup
+
+Prepared the system for Phase 1 memory component training (memory components only, with salience-gated fusion).
+
+**Created scripts:**
+- `scripts/VLM_Dual_Mem/train_memory_phase1.sh` - Phase 1 training script based on `train_vsibench.sh`
+  - Trains only memory components (attention modules + MLPs)
+  - Freezes base VLM-3R (vision tower, language model, spatial tower)
+  - Freezes fusion block and MM projector (keeps pre-trained weights)
+  - Learning rate: 1e-4 (per Phase 1 recommendations)
+  - Salience gate enabled by default
+
+**Updated scripts:**
+- `llava/train/train.py` - Added memory component training support:
+  - Added `tune_memory_components` flag to `ModelArguments`
+  - Modified `find_all_linear_names()` to exclude memory components from LoRA targets (trained fully)
+  - Added Phase 1 training logic:
+    - When `tune_memory_components=True`, freezes entire model then makes memory components trainable:
+      - `working_attention`: Full training (small MultiheadAttention module)
+      - `episodic_attention`: Full training (small MultiheadAttention module)
+      - `memory_fusion_mlp`: Full training (small MLP)
+      - `salience_gate`: Full training (if enabled, small MLP)
+    - Ensures fusion block and MM projector remain frozen
+    - Prints debug messages showing trainable/frozen components
+
+**Training configuration:**
+- **Trainable**: Memory components only (attention modules + MLPs)
+- **Frozen**: Vision tower, language model, spatial tower, fusion block, MM projector
+- **Learning rate**: 1e-4 (higher than base model training, per Phase 1 recommendations)
+- **Epochs**: 5
+- **LoRA**: Applied to language model only (r=64, alpha=128)
+- **Salience gate**: Enabled by default
+
+**Usage:**
+```bash
+bash scripts/VLM_Dual_Mem/train_memory_phase1.sh
+```
+
+The system is now ready for Phase 1 training with salience-gated fusion enabled.
+

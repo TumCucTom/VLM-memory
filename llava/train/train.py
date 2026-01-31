@@ -191,6 +191,11 @@ class ModelArguments:
     fusion_block: Optional[str] = field(default=None)
     tune_fusion_block: bool = field(default=False)
 
+    ## memory components (dual memory system)
+    tune_memory_components: bool = field(default=False, metadata={"help": "Enable training of memory components (working_attention, episodic_attention, memory_fusion_mlp, salience_gate)"})
+    memory_lora_r: int = field(default=64, metadata={"help": "LoRA rank for memory attention modules"})
+    memory_lora_alpha: int = field(default=128, metadata={"help": "LoRA alpha for memory attention modules"})
+
     unfreeze_mm_vision_tower: bool = field(default=False)
     unfreeze_language_model: bool = field(default=False)
     mm_vision_select_layer: Optional[int] = field(default=-1)  # default to the last layer
@@ -361,10 +366,25 @@ def get_mm_adapter_state_maybe_zero_3(named_params, keys_to_match):
     return to_return
 
 
-def find_all_linear_names(model):
+def find_all_linear_names(model, include_memory_components=False):
+    """
+    Find all linear layer names for LoRA targeting.
+    
+    Args:
+        model: The model to search
+        include_memory_components: If True, include memory attention modules in LoRA targets
+            Note: Memory attention modules (MultiheadAttention) are small and will be trained fully,
+            not via LoRA, as PEFT LoRA targets Linear layers, not MultiheadAttention directly.
+    """
     cls = torch.nn.Linear
     lora_module_names = set()
     multimodal_keywords = ['mm_projector', 'vision_tower', 'vision_resampler', 'spatial_tower', 'fusion_block']
+    
+    # Always exclude memory components from LoRA targets
+    # Memory attention modules will be trained fully (they're small)
+    # Memory fusion MLP and salience gate will also be trained fully
+    multimodal_keywords.extend(['memory_fusion_mlp', 'salience_gate', 'working_attention', 'episodic_attention'])
+    
     for name, module in model.named_modules():
         if any(mm_keyword in name for mm_keyword in multimodal_keywords):
             continue
@@ -2138,10 +2158,14 @@ def train(attn_implementation=None):
     if training_args.lora_enable:
         from peft import LoraConfig, get_peft_model
 
+        # Memory components are trained fully (not via LoRA) since they're small
+        # LoRA is only for language model layers
+        lora_target_modules = find_all_linear_names(model, include_memory_components=False)
+        
         lora_config = LoraConfig(
             r=training_args.lora_r,
             lora_alpha=training_args.lora_alpha,
-            target_modules=find_all_linear_names(model),
+            target_modules=lora_target_modules,
             lora_dropout=training_args.lora_dropout,
             bias=training_args.lora_bias,
             task_type="CAUSAL_LM",
@@ -2258,12 +2282,24 @@ def train(attn_implementation=None):
             model.config.tune_mm_vision_resampler = training_args.tune_mm_vision_resampler = model_args.tune_mm_vision_resampler
             model.config.tune_spatial_tower = training_args.tune_spatial_tower = model_args.tune_spatial_tower
             model.config.tune_fusion_block = training_args.tune_fusion_block = model_args.tune_fusion_block
-            if model_args.tune_mm_mlp_adapter or model_args.tune_mm_vision_resampler or model_args.tune_fusion_block or model_args.tune_spatial_tower:
+            model.config.tune_memory_components = training_args.tune_memory_components = getattr(model_args, 'tune_memory_components', False)
+            
+            # Phase 1: If training memory components, freeze everything else
+            # Phase 1 trains only memory components, keeping fusion block and MM projector frozen
+            if model_args.tune_memory_components:
+                # Freeze entire model first
                 model.requires_grad_(False)
+                # Then unfreeze only memory components
+                rank0_print("Phase 1: Training memory components only. Freezing base VLM-3R components.")
+            elif model_args.tune_mm_mlp_adapter or model_args.tune_mm_vision_resampler or model_args.tune_fusion_block or model_args.tune_spatial_tower:
+                model.requires_grad_(False)
+            
             if training_args.lora_enable:
                 for name, param in model.named_parameters():
                     if 'lora_' in name:  # 不冻结LoRA参数
                         param.requires_grad = True
+            
+            # Set trainable parameters for traditional components
             if model_args.tune_spatial_tower:
                 for p in model.get_spatial_tower().parameters():
                     p.requires_grad = True
@@ -2276,6 +2312,53 @@ def train(attn_implementation=None):
             if model_args.tune_mm_vision_resampler:
                 for p in model.get_model().vision_resampler.parameters():
                     p.requires_grad = True
+            
+            # Phase 1: Make memory components trainable
+            if model_args.tune_memory_components:
+                rank0_print("Making memory components trainable...")
+                model_base = model.get_model()
+                
+                # Memory attention modules: Train fully (they're small, MultiheadAttention modules)
+                # PEFT LoRA targets Linear layers, not MultiheadAttention directly
+                if hasattr(model_base, 'working_attention'):
+                    for p in model_base.working_attention.parameters():
+                        p.requires_grad = True
+                    rank0_print("  - working_attention: trainable (full)")
+                
+                if hasattr(model_base, 'episodic_attention'):
+                    for p in model_base.episodic_attention.parameters():
+                        p.requires_grad = True
+                    rank0_print("  - episodic_attention: trainable (full)")
+                
+                # Memory fusion MLP: Train fully (small MLP, can afford full training)
+                if hasattr(model_base, 'memory_fusion_mlp'):
+                    for p in model_base.memory_fusion_mlp.parameters():
+                        p.requires_grad = True
+                    rank0_print("  - memory_fusion_mlp: trainable (full)")
+                
+                # Salience gate: Train fully (if enabled)
+                if hasattr(model_base, 'episodic_memory') and hasattr(model_base.episodic_memory, 'salience_gate'):
+                    if model_base.episodic_memory.use_gated_attention:
+                        for p in model_base.episodic_memory.salience_gate.parameters():
+                            p.requires_grad = True
+                        rank0_print("  - salience_gate: trainable (full)")
+                    else:
+                        rank0_print("  - salience_gate: disabled (use_gated_attention=False)")
+                
+                # Verify fusion block and MM projector are frozen
+                if hasattr(model, 'get_fusion_block'):
+                    fusion_block = model.get_fusion_block()
+                    if fusion_block is not None:
+                        for p in fusion_block.parameters():
+                            p.requires_grad = False
+                        rank0_print("  - fusion_block: frozen (Phase 1)")
+                
+                if hasattr(model_base, 'mm_projector'):
+                    for p in model_base.mm_projector.parameters():
+                        p.requires_grad = False
+                    rank0_print("  - mm_projector: frozen (Phase 1)")
+                
+                rank0_print("Memory component training setup complete.")
 
             model.config.freeze_mm_mlp_adapter = training_args.freeze_mm_mlp_adapter
             if training_args.freeze_mm_mlp_adapter:
