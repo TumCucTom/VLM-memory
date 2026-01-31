@@ -8,8 +8,7 @@
 
 # set training parameters
 # IMPORTANT: Set NUM_GPUS_PER_NODE to the number of GPUs you want to use on this machine.
-# Default to 4 (matching A100 nodes on this cluster), can be overridden via environment variable
-NUM_GPUS_PER_NODE=${NUM_GPUS_PER_NODE:-4} # Use env var if set, otherwise default to 4
+export NUM_GPUS_PER_NODE=1
 MASTER_ADDR="localhost" # For single-node multi-GPU
 
 MASTER_PORT=30000
@@ -18,7 +17,8 @@ MASTER_PORT=30000
 IMAGE_FOLDER="data/vlm_3r_data"
 VIDEO_FOLDER="data/vlm_3r_data"
 DATA_YAML="scripts/VLM_3R/vsibench_data.yaml" # e.g exp.yaml
-SUFFIX="vlm_3r_memory_phase1_salience_gated"
+# Add suffix based on number of GPUs
+SUFFIX="vlm_3r_memory_phase1_salience_gated_1gpu"
 NUM_TRAIN_EPOCHS=5
 SAVE_TOTAL_LIMIT=5
 SPATIAL_TOWER="cut3r"
@@ -30,9 +30,9 @@ TUNE_MM_MLP_ADAPTER=False
 TUNE_FUSION_BLOCK=False
 # Enable memory component training
 TUNE_MEMORY_COMPONENTS=True
-# Adjust gradient accumulation: bs=128 total, with 4 GPUs we need 32 steps per GPU
-# (was 16 for 8 GPUs: 16 * 8 = 128, now 32 * 4 = 128)
-GRADIENT_ACCUMULATION_STEPS=32 # bs=128, num_gpus=4
+# Adjust gradient accumulation: bs=128 total
+# For 4 GPUs: 32 * 4 = 128, for 1 GPU: 128 * 1 = 128
+GRADIENT_ACCUMULATION_STEPS=128 # bs=128, num_gpus=1
 
 ################ Arnold Jobs ################
 VISION_MODEL_VERSION="google/siglip-so400m-patch14-384"

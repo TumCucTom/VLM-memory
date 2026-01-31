@@ -5,9 +5,9 @@
 #SBATCH --time=7-00:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=32
-#SBATCH --mem=400G
-#SBATCH --gres=gpu:a100-sxm4-40gb:4
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=100G
+#SBATCH --gres=gpu:a100-sxm4-40gb:1
 #SBATCH --partition=mlcnu
 #SBATCH --account=coms037985
 
@@ -54,9 +54,8 @@ export TOKENIZERS_PARALLELISM=false
 # Enable CUDA debugging to get better error messages (optional, can disable for performance)
 # export CUDA_LAUNCH_BLOCKING=1
 
-# Set NUM_GPUS_PER_NODE to match allocated GPUs (4 A100s per node)
-# The training script will use this environment variable if set, otherwise defaults to 4
-export NUM_GPUS_PER_NODE=4
+# Set NUM_GPUS_PER_NODE to match allocated GPUs
+export NUM_GPUS_PER_NODE=1
 
 # Run the Phase 1 training script
 bash scripts/VLM_Dual_Mem/train_memory_phase1.sh
