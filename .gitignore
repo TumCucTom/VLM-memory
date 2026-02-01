@@ -78,3 +78,5 @@ work_dirs_auto_eval/
 .hypothesis/
 
 .vscode/
+
+.env

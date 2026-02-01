@@ -39,9 +39,9 @@ VISION_MODEL_VERSION="google/siglip-so400m-patch14-384"
 
 PROMPT_VERSION="qwen_1_5"
 MID_RUN_NAME="llava_video_7b_qwen2_${SUFFIX}"
-PREV_STAGE_CHECKPOINT="checkpoints/LLaVA-Video-7B-Qwen2"
+PREV_STAGE_CHECKPOINT="lmms-lab/LLaVA-NeXT-Video-7B-Qwen2"
 
-ACCELERATE_CPU_AFFINITY=1 torchrun \
+ACCELERATE_CPU_AFFINITY=0 torchrun \
     --nproc_per_node=$NUM_GPUS_PER_NODE \
     --nnodes=1 \
     --node_rank=0 \
