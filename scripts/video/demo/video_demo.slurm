@@ -55,10 +55,13 @@ export CUDA_LAUNCH_BLOCKING=1
 # by setting IDX=1 to match default behavior
 export IDX=1
 
+# Set the prompt for the video demo
+export PROMPT="What did the switches turned on do? Are they the correct switches to turned on for frying an egg? "
+
 bash scripts/video/demo/video_demo.sh \
     Journey9ni/vlm-3r-llava-qwen2-lora \
     qwen_1_5 64 2 average grid True \
-    playground/demo/47334096.mp4 \
+    playground/demo/demo_video2.mp4 \
     lmms-lab/LLaVA-NeXT-Video-7B-Qwen2
 
 # Print completion time

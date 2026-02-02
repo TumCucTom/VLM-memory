@@ -33,4 +33,4 @@ python3 playground/demo/video_demo.py \
     --conv-mode $CONV_MODE \
     --mm_spatial_pool_mode ${POOL_MODE:-average} \
     --mm_newline_position ${NEWLINE_POSITION:-grid} \
-    --prompt "Estimate the dimensions in centimeters and volume of the microwave"
+    --prompt "${PROMPT:-Estimate the dimensions in centimeters and volume of the microwave}"
