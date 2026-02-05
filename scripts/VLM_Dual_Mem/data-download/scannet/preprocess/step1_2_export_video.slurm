@@ -23,10 +23,6 @@ cd ~/VLM-memory
 # Activate Python virtual environment
 source ~/venvs/vlm3r/bin/activate
 
-# Install required dependencies if missing
-python3 -c "import cv2" 2>/dev/null || pip install opencv-python
-python3 -c "import png" 2>/dev/null || pip install pypng
-
 # Create logs directory if it doesn't exist
 mkdir -p logs
 

@@ -42,32 +42,6 @@ if [ ! -f "data/raw_data/scannet/scannetv2-labels.combined.tsv" ]; then
     exit 1
 fi
 
-# Check if scene metadata .txt files exist (required for preprocessing)
-# Sample a few scenes to check
-SAMPLE_SCENES=("scene0000_00" "scene0001_00" "scene0002_00")
-MISSING_TXT=0
-for scene in "${SAMPLE_SCENES[@]}"; do
-    if [ ! -f "data/vlm_3r_data/scannet/scans/${scene}/${scene}.txt" ]; then
-        MISSING_TXT=1
-        break
-    fi
-done
-
-if [ $MISSING_TXT -eq 1 ]; then
-    echo "ERROR: Scene metadata .txt files are missing!"
-    echo "The preprocessing script requires .txt files in each scene directory."
-    echo "These contain axis alignment and camera intrinsics information."
-    echo ""
-    echo "You need to download .txt files for all scenes first."
-    echo "Create a script to download them using:"
-    echo "  python scripts/VLM_Dual_Mem/data-download/scannet/download-scannet.py \\"
-    echo "    -o data/vlm_3r_data/scannet/scans \\"
-    echo "    --type .txt"
-    echo ""
-    echo "Or use the download script with --type .txt for each scene."
-    exit 1
-fi
-
 # Create output directory
 mkdir -p data/processed_data/ScanNet/point_cloud
 
