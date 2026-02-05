@@ -107,7 +107,7 @@ export PIP_CACHE_DIR=~/work/pip-cache
 
    ```
    pip install --upgrade pip
-   pip install torch==2.1.1 torchvision==0.16.1 --index-url https://download.pytorch.org/whl/cu121
+   pip install torch==2.1.1 torchvision==0.16.1 --extra-index-url https://download.pytorch.org/whl/cu121
    ```
 
 3. **Install project dependencies:**
