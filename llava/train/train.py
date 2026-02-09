@@ -193,6 +193,7 @@ class ModelArguments:
 
     ## memory components (dual memory system)
     tune_memory_components: bool = field(default=False, metadata={"help": "Enable training of memory components (working_attention, episodic_attention, memory_fusion_mlp, salience_gate)"})
+    memory_mode: str = field(default="working_only", metadata={"help": "Memory training mode: 'working_only', 'episodic_only', or 'both' (default: working_only)"})
     memory_lora_r: int = field(default=64, metadata={"help": "LoRA rank for memory attention modules"})
     memory_lora_alpha: int = field(default=128, metadata={"help": "LoRA alpha for memory attention modules"})
 
@@ -2283,6 +2284,7 @@ def train(attn_implementation=None):
             model.config.tune_spatial_tower = training_args.tune_spatial_tower = model_args.tune_spatial_tower
             model.config.tune_fusion_block = training_args.tune_fusion_block = model_args.tune_fusion_block
             model.config.tune_memory_components = training_args.tune_memory_components = getattr(model_args, 'tune_memory_components', False)
+            model.config.memory_mode = getattr(model_args, 'memory_mode', 'working_only')
             
             # Phase 1: If training memory components, freeze everything else
             # Phase 1 trains only memory components, keeping fusion block and MM projector frozen
@@ -2315,35 +2317,58 @@ def train(attn_implementation=None):
             
             # Phase 1: Make memory components trainable
             if model_args.tune_memory_components:
-                rank0_print("Making memory components trainable...")
+                memory_mode = getattr(model_args, 'memory_mode', 'working_only').lower()
+                rank0_print(f"Making memory components trainable (mode: {memory_mode})...")
                 model_base = model.get_model()
+                
+                # Determine which components to train based on memory_mode
+                train_working = memory_mode in ['working_only', 'both']
+                train_episodic = memory_mode in ['episodic_only', 'both']
+                train_fusion = memory_mode == 'both'  # Only train fusion when both memories are used
                 
                 # Memory attention modules: Train fully (they're small, MultiheadAttention modules)
                 # PEFT LoRA targets Linear layers, not MultiheadAttention directly
-                if hasattr(model_base, 'working_attention'):
+                if train_working and hasattr(model_base, 'working_attention'):
                     for p in model_base.working_attention.parameters():
                         p.requires_grad = True
                     rank0_print("  - working_attention: trainable (full)")
+                elif hasattr(model_base, 'working_attention'):
+                    for p in model_base.working_attention.parameters():
+                        p.requires_grad = False
+                    rank0_print("  - working_attention: frozen (not in current mode)")
                 
-                if hasattr(model_base, 'episodic_attention'):
+                if train_episodic and hasattr(model_base, 'episodic_attention'):
                     for p in model_base.episodic_attention.parameters():
                         p.requires_grad = True
                     rank0_print("  - episodic_attention: trainable (full)")
+                elif hasattr(model_base, 'episodic_attention'):
+                    for p in model_base.episodic_attention.parameters():
+                        p.requires_grad = False
+                    rank0_print("  - episodic_attention: frozen (not in current mode)")
                 
                 # Memory fusion MLP: Train fully (small MLP, can afford full training)
-                if hasattr(model_base, 'memory_fusion_mlp'):
+                # Only train fusion when both memories are used
+                if train_fusion and hasattr(model_base, 'memory_fusion_mlp'):
                     for p in model_base.memory_fusion_mlp.parameters():
                         p.requires_grad = True
                     rank0_print("  - memory_fusion_mlp: trainable (full)")
+                elif hasattr(model_base, 'memory_fusion_mlp'):
+                    for p in model_base.memory_fusion_mlp.parameters():
+                        p.requires_grad = False
+                    rank0_print("  - memory_fusion_mlp: frozen (not in current mode)")
                 
-                # Salience gate: Train fully (if enabled)
-                if hasattr(model_base, 'episodic_memory') and hasattr(model_base.episodic_memory, 'salience_gate'):
+                # Salience gate: Train fully (if enabled and episodic memory is being trained)
+                if train_episodic and hasattr(model_base, 'episodic_memory') and hasattr(model_base.episodic_memory, 'salience_gate'):
                     if model_base.episodic_memory.use_gated_attention:
                         for p in model_base.episodic_memory.salience_gate.parameters():
                             p.requires_grad = True
                         rank0_print("  - salience_gate: trainable (full)")
                     else:
                         rank0_print("  - salience_gate: disabled (use_gated_attention=False)")
+                elif hasattr(model_base, 'episodic_memory') and hasattr(model_base.episodic_memory, 'salience_gate'):
+                    for p in model_base.episodic_memory.salience_gate.parameters():
+                        p.requires_grad = False
+                    rank0_print("  - salience_gate: frozen (not in current mode)")
                 
                 # Verify fusion block and MM projector are frozen
                 if hasattr(model, 'get_fusion_block'):
@@ -2358,7 +2383,7 @@ def train(attn_implementation=None):
                         p.requires_grad = False
                     rank0_print("  - mm_projector: frozen (Phase 1)")
                 
-                rank0_print("Memory component training setup complete.")
+                rank0_print(f"Memory component training setup complete (mode: {memory_mode}).")
 
             model.config.freeze_mm_mlp_adapter = training_args.freeze_mm_mlp_adapter
             if training_args.freeze_mm_mlp_adapter:

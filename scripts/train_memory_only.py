@@ -49,6 +49,9 @@ def create_memory_only_args():
                        help="Also train fusion block (recommended)")
     
     # Memory configuration
+    parser.add_argument("--memory_mode", type=str, default="working_only",
+                       choices=["working_only", "episodic_only", "both"],
+                       help="Memory training mode: 'working_only', 'episodic_only', or 'both' (default: working_only)")
     parser.add_argument("--memory_L_w", type=int, default=8,
                        help="Working memory capacity")
     parser.add_argument("--memory_L_e", type=int, default=32,
@@ -98,11 +101,12 @@ def setup_memory_only_training(args):
         tune_fusion_block=args.train_fusion_block,  # Optional
         tune_mm_mlp_adapter=False,  # Freeze projector
         use_dual_memory=True,  # Enable memory
+        memory_mode=args.memory_mode,  # Memory mode: working_only, episodic_only, or both
         memory_L_w=args.memory_L_w,
         memory_L_e=args.memory_L_e,
         memory_num_heads=args.memory_num_heads,
         memory_dropout=args.memory_dropout,
-        tune_dual_memory=True,  # Train memory
+        tune_memory_components=True,  # Train memory components
         mm_tunable_parts="dual_memory" + (",fusion_block" if args.train_fusion_block else ""),
         version="qwen_1_5",
         mm_projector_type="mlp2x_gelu",
@@ -212,6 +216,7 @@ def main():
     rank0_print("Memory-Only Fine-Tuning")
     rank0_print("="*60)
     rank0_print(f"Model: {args.model_path}")
+    rank0_print(f"Memory Mode: {args.memory_mode}")
     rank0_print(f"Memory: L_w={args.memory_L_w}, L_e={args.memory_L_e}")
     rank0_print(f"Training: Memory modules {'+ Fusion' if args.train_fusion_block else 'only'}")
     rank0_print("="*60 + "\n")

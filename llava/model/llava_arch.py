@@ -134,13 +134,18 @@ class LlavaMetaModel:
         """
         Apply Dual Memory System (Algorithm 1 from VLM² paper)
         
+        Supports three modes:
+        - "working_only": Use only working memory (no fusion, no episodic memory)
+        - "episodic_only": Use only episodic memory (no fusion, no working memory)
+        - "both": Use both memories with fusion (default dual memory system)
+        
         Implements:
-        1. M_t^w ← Working Attention(Q = H_t, KV = W_t)  [Line 1]
-        2. M_t^e ← Episodic Attention(Q = H_t, KV = E_t)  [Line 2]
-        3. γ_t ← MLP([M_t^w; M_t^e])  [Line 5]
-        4. M_t ← γ_t ⊙ M_t^w + (1-γ_t) ⊙ M_t^e  [Lines 6-7]
-        5. Update Working Memory (FIFO)  [Lines 8-14]
-        6. Update Episodic Memory (similarity-based replacement)  [Lines 15-24]
+        1. M_t^w ← Working Attention(Q = H_t, KV = W_t)  [Line 1] (if working_only or both)
+        2. M_t^e ← Episodic Attention(Q = H_t, KV = E_t)  [Line 2] (if episodic_only or both)
+        3. γ_t ← MLP([M_t^w; M_t^e])  [Line 5] (only if both)
+        4. M_t ← γ_t ⊙ M_t^w + (1-γ_t) ⊙ M_t^e  [Lines 6-7] (only if both)
+        5. Update Working Memory (FIFO)  [Lines 8-14] (if working_only or both)
+        6. Update Episodic Memory (similarity-based replacement)  [Lines 15-24] (if episodic_only or both)
         
         For videos, processes frames individually to maintain temporal memory.
         For single images, processes once.
@@ -154,14 +159,20 @@ class LlavaMetaModel:
                 This is the output from mm_projector (or fusion_block + mm_projector)
         
         Returns:
-            M_t: Fused memory output [B*T, N, D] or [B, N, D]
-                If both memories are empty, returns H_t (no retrieval)
+            M_t: Memory-enhanced output [B*T, N, D] or [B, N, D]
+                If memories are empty, returns H_t (no retrieval)
         """
         working_memory = self.get_working_memory()
         episodic_memory = self.get_episodic_memory()
         
-        # If no memory modules, return original features
-        if working_memory is None and episodic_memory is None:
+        # Get memory mode from config (default: "working_only")
+        memory_mode = getattr(self.config, 'memory_mode', 'working_only').lower()
+        use_working = memory_mode in ['working_only', 'both']
+        use_episodic = memory_mode in ['episodic_only', 'both']
+        use_fusion = memory_mode == 'both'
+        
+        # If no memory modules or mode doesn't match available memories, return original features
+        if (working_memory is None and use_working) or (episodic_memory is None and use_episodic):
             return H_t
         
         device = H_t.device
@@ -189,8 +200,9 @@ class LlavaMetaModel:
                               f"query shape: {query.shape}")
                 
                 # Algorithm 1 Line 1: M_t^w ← Working Attention(Q = H_t, KV = W_t)
+                # Only use working memory if mode is working_only or both
                 M_t_w_frame = None
-                if working_memory is not None:
+                if use_working and working_memory is not None:
                     W_t = working_memory.get_buffer()
                     if len(W_t) > 0:
                         rank0_print(f"[Dual Memory] Frame {frame_idx}: Working memory retrieval from {len(W_t)} elements")
@@ -237,8 +249,9 @@ class LlavaMetaModel:
                     M_t_w_frame = H_t_frame
                 
                 # Algorithm 1 Line 2: M_t^e ← Episodic Attention(Q = H_t, KV = E_t)
+                # Only use episodic memory if mode is episodic_only or both
                 M_t_e_frame = None
-                if episodic_memory is not None:
+                if use_episodic and episodic_memory is not None:
                     E_t = episodic_memory.get_buffer()
                     if len(E_t) > 0:
                         rank0_print(f"[Dual Memory] Frame {frame_idx}: Episodic memory retrieval from {len(E_t)} elements")
@@ -284,32 +297,42 @@ class LlavaMetaModel:
                 else:
                     M_t_e_frame = H_t_frame
                 
-                # Algorithm 1 Lines 5-7: Gated Memory Fusion
+                # Algorithm 1 Lines 5-7: Gated Memory Fusion (only if both memories are used)
                 # γ_t = σ(MLP(Concat[M_t^w; M_t^e]))
                 # M_t = γ_t ⊙ M_t^w + (1-γ_t) ⊙ M_t^e
-                # Concatenate along feature dimension: [N, D] + [N, D] -> [N, 2*D]
-                M_concat = torch.cat([M_t_w_frame, M_t_e_frame], dim=-1)  # [N, 2*D]
-                
-                # Compute gate: [N, 2*D] -> [N, D]
-                gamma_t = self.memory_fusion_mlp(M_concat)  # [N, D]
-                
-                # DEBUG: Verify gate values are in [0, 1] and vary
-                gamma_min = gamma_t.min().item()
-                gamma_max = gamma_t.max().item()
-                gamma_mean = gamma_t.mean().item()
-                gamma_std = gamma_t.std().item()
-                if frame_idx < 3 or frame_idx % 10 == 0:
-                    rank0_print(f"[DEBUG] Frame {frame_idx}: Memory fusion gate γ_t - "
-                              f"min: {gamma_min:.4f}, max: {gamma_max:.4f}, "
-                              f"mean: {gamma_mean:.4f}, std: {gamma_std:.4f}")
-                
-                # Verify gate is in valid range [0, 1]
-                if gamma_min < -0.01 or gamma_max > 1.01:
-                    rank0_print(f"[WARNING] Frame {frame_idx}: Gate values out of [0,1] range! "
-                              f"min: {gamma_min:.4f}, max: {gamma_max:.4f}")
-                
-                # Fused output (Algorithm 1 Line 7): [N, D]
-                M_t_frame = gamma_t * M_t_w_frame + (1 - gamma_t) * M_t_e_frame
+                if use_fusion:
+                    # Concatenate along feature dimension: [N, D] + [N, D] -> [N, 2*D]
+                    M_concat = torch.cat([M_t_w_frame, M_t_e_frame], dim=-1)  # [N, 2*D]
+                    
+                    # Compute gate: [N, 2*D] -> [N, D]
+                    gamma_t = self.memory_fusion_mlp(M_concat)  # [N, D]
+                    
+                    # DEBUG: Verify gate values are in [0, 1] and vary
+                    gamma_min = gamma_t.min().item()
+                    gamma_max = gamma_t.max().item()
+                    gamma_mean = gamma_t.mean().item()
+                    gamma_std = gamma_t.std().item()
+                    if frame_idx < 3 or frame_idx % 10 == 0:
+                        rank0_print(f"[DEBUG] Frame {frame_idx}: Memory fusion gate γ_t - "
+                                  f"min: {gamma_min:.4f}, max: {gamma_max:.4f}, "
+                                  f"mean: {gamma_mean:.4f}, std: {gamma_std:.4f}")
+                    
+                    # Verify gate is in valid range [0, 1]
+                    if gamma_min < -0.01 or gamma_max > 1.01:
+                        rank0_print(f"[WARNING] Frame {frame_idx}: Gate values out of [0,1] range! "
+                                  f"min: {gamma_min:.4f}, max: {gamma_max:.4f}")
+                    
+                    # Fused output (Algorithm 1 Line 7): [N, D]
+                    M_t_frame = gamma_t * M_t_w_frame + (1 - gamma_t) * M_t_e_frame
+                elif use_working:
+                    # Working memory only: use M_t_w directly
+                    M_t_frame = M_t_w_frame
+                elif use_episodic:
+                    # Episodic memory only: use M_t_e directly
+                    M_t_frame = M_t_e_frame
+                else:
+                    # Fallback: should not happen, but use H_t
+                    M_t_frame = H_t_frame
                 
                 # DEBUG: Verify fusion produces different output
                 M_t_frame_mean = M_t_frame.mean().item()
@@ -320,11 +343,12 @@ class LlavaMetaModel:
                 
                 # Extract representations for storage: mean pool over sequence
                 H_t_for_storage = H_t_frame.mean(dim=0)  # [D] - for working memory
-                M_t_for_storage = M_t_frame.mean(dim=0)  # [D] - for episodic memory (fused memory)
+                M_t_for_storage = M_t_frame.mean(dim=0)  # [D] - for episodic memory (fused memory or working memory output)
                 
                 # Algorithm 1 Lines 8-14: Update Working Memory (FIFO)
                 # Working memory uses H_t (raw input features)
-                if working_memory is not None:
+                # Only update if working memory is enabled
+                if use_working and working_memory is not None:
                     old_w_size = len(working_memory)
                     old_w_buffer = working_memory.get_buffer().copy() if old_w_size > 0 else []
                     old_w_first = old_w_buffer[0].clone() if len(old_w_buffer) > 0 else None
@@ -351,9 +375,10 @@ class LlavaMetaModel:
                                   f"(capacity: {working_memory.L_w}, is_full: {working_memory.is_full()})")
                 
                 # Algorithm 1 Lines 15-24: Update Episodic Memory (similarity-based replacement)
-                # Episodic memory uses M_t (fused memory-enhanced representation)
+                # Episodic memory uses M_t (fused memory-enhanced representation or working memory output)
                 # According to Algorithm 1: E_{t+1} ← E_t ∪ {M_t} (Line 16) or E_{t+1}[j*] ← M_t (Line 19)
-                if episodic_memory is not None:
+                # Only update if episodic memory is enabled
+                if use_episodic and episodic_memory is not None:
                     old_e_size = len(episodic_memory)
                     old_e_buffer = episodic_memory.get_buffer().copy() if old_e_size > 0 else []
                     
@@ -421,9 +446,9 @@ class LlavaMetaModel:
             # Single frame processing
             query = H_t.unsqueeze(0) if H_t.dim() == 2 else H_t.unsqueeze(0).unsqueeze(0)  # [1, N, D] or [1, 1, D]
             
-            # Working memory retrieval
+            # Working memory retrieval (only if working_only or both)
             M_t_w = None
-            if working_memory is not None:
+            if use_working and working_memory is not None:
                 W_t = working_memory.get_buffer()
                 if len(W_t) > 0:
                     memory_list = [mem_elem.to(device).flatten() if mem_elem.dim() > 1 else mem_elem.to(device) 
@@ -436,9 +461,9 @@ class LlavaMetaModel:
             else:
                 M_t_w = H_t
             
-            # Episodic memory retrieval
+            # Episodic memory retrieval (only if episodic_only or both)
             M_t_e = None
-            if episodic_memory is not None:
+            if use_episodic and episodic_memory is not None:
                 E_t = episodic_memory.get_buffer()
                 if len(E_t) > 0:
                     memory_list = [mem_elem.to(device).flatten() if mem_elem.dim() > 1 else mem_elem.to(device) 
@@ -451,23 +476,35 @@ class LlavaMetaModel:
             else:
                 M_t_e = H_t
             
-            # Algorithm 1 Lines 5-7: Gated Memory Fusion
+            # Algorithm 1 Lines 5-7: Gated Memory Fusion (only if both memories are used)
             # γ_t = σ(MLP(Concat[M_t^w; M_t^e]))
             # M_t = γ_t ⊙ M_t^w + (1-γ_t) ⊙ M_t^e
-            M_concat = torch.cat([M_t_w, M_t_e], dim=-1)
-            gamma_t = self.memory_fusion_mlp(M_concat)
-            M_t = gamma_t * M_t_w + (1 - gamma_t) * M_t_e  # No residual connection per Algorithm 1
+            if use_fusion:
+                M_concat = torch.cat([M_t_w, M_t_e], dim=-1)
+                gamma_t = self.memory_fusion_mlp(M_concat)
+                M_t = gamma_t * M_t_w + (1 - gamma_t) * M_t_e  # No residual connection per Algorithm 1
+            elif use_working:
+                # Working memory only: use M_t_w directly
+                M_t = M_t_w
+            elif use_episodic:
+                # Episodic memory only: use M_t_e directly
+                M_t = M_t_e
+            else:
+                # Fallback: should not happen, but use H_t
+                M_t = H_t
             
             # Extract representations for storage
             H_t_for_storage = H_t.mean(dim=0) if H_t.dim() == 2 else H_t.flatten()  # For working memory
             M_t_for_storage = M_t.mean(dim=0) if M_t.dim() == 2 else M_t.flatten()  # For episodic memory
             
             # Algorithm 1 Lines 8-14: Update Working Memory (FIFO) with H_t
-            if working_memory is not None:
+            # Only update if working memory is enabled
+            if use_working and working_memory is not None:
                 working_memory.update(H_t_for_storage)
             
             # Algorithm 1 Lines 15-24: Update Episodic Memory (similarity-based) with M_t
-            if episodic_memory is not None:
+            # Only update if episodic memory is enabled
+            if use_episodic and episodic_memory is not None:
                 episodic_memory.update(M_t_for_storage)  # Use M_t, not H_t!
         
         return M_t
