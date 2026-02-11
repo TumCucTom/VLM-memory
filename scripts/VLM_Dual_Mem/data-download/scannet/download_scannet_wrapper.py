@@ -37,18 +37,30 @@ def download_scene(download_script, out_dir, scene_id, file_type='.sens', skip_e
         child.sendline('y')
         
         # Handle file type prompt (if it appears for v2)
+        # For non-.sens file types, the script may exit immediately after download
         # For .txt files, there might be a different prompt or no prompt
         try:
-            child.expect(['Press.*n.*exclude', 'Press.*exclude', 'Note: ScanNet v2', 'Press any key'], timeout=5)
+            index = child.expect(['Press.*n.*exclude', 'Press.*exclude', 'Note: ScanNet v2', 'Press any key'], timeout=5)
+            # Got a prompt, send response
             child.sendline('y')  # We want the files (press any key except 'n')
+            # Wait for process to complete
+            child.expect(pexpect.EOF, timeout=3600)
         except pexpect.TIMEOUT:
-            pass  # Prompt didn't appear, continue
+            # No prompt appeared, wait for process to complete
+            child.expect(pexpect.EOF, timeout=3600)
+        except pexpect.EOF:
+            # Process already ended - this is OK for non-.sens file types
+            # The download may have completed successfully
+            pass
         
-        child.expect(pexpect.EOF, timeout=3600)
         output = child.before
         child.close()
         
-        return child.exitstatus == 0, output
+        # Check if download was successful by looking at exit status or output
+        # Exit status might be None if process ended normally, so also check output
+        success = (child.exitstatus == 0) or (child.exitstatus is None and 'Downloaded scan' in output)
+        
+        return success, output
         
     except ImportError:
         # Fallback: use subprocess with pre-written input
