@@ -127,7 +127,7 @@ def read_camera_npz(file_path: str) -> Dict[str, Any] | None:
 
 # --- Processor Implementation ---
 
-class ScanNetppFrameProcessor(AbstractSceneProcessor[ScanNetppFrameProcessorConfig]):
+class ScanNetppFrameProcessor(AbstractSceneProcessor):
     """
     Processor for ScanNet++ dataset frame metadata. Reads data from rendered and raw directories.
     """
@@ -203,7 +203,10 @@ class ScanNetppFrameProcessor(AbstractSceneProcessor[ScanNetppFrameProcessorConf
 
         # --- 2. Define Data Directories ---
         # Using scene_render_dir which points to .../<scene_id>/dslr/
+        # Try both possible directory names (rgb_resized_undistorted for rendered data, resized_undistorted_images for raw data)
         color_dir = os.path.join(scene_render_dir, 'rgb_resized_undistorted')
+        if not os.path.isdir(color_dir):
+            color_dir = os.path.join(scene_render_dir, 'resized_undistorted_images')
         depth_dir = os.path.join(scene_render_dir, 'render_depth')
         instance_dir = os.path.join(scene_render_dir, 'render_instance') # Note: Original comment had 'render_instance/render_instance'
         camera_dir = os.path.join(scene_render_dir, 'camera')
@@ -228,7 +231,8 @@ class ScanNetppFrameProcessor(AbstractSceneProcessor[ScanNetppFrameProcessorConf
 
             # Construct paths for this frame
             color_path_abs = os.path.join(color_dir, image_filename) # Assume JPG or similar from split list
-            color_path_rel = os.path.join(scene_id, 'dslr', 'rgb_resized_undistorted', image_filename) # Relative path for metadata
+            # Use the actual directory name that exists (resized_undistorted_images)
+            color_path_rel = os.path.join(scene_id, 'dslr', 'resized_undistorted_images', image_filename) # Relative path for metadata
 
             # Assume other files use the base name + standard extension
             depth_path_abs = os.path.join(depth_dir, f"{frame_id_base}.png")

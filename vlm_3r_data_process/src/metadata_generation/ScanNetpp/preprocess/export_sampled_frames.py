@@ -403,9 +403,13 @@ def export_sampled_frames(split_path, raw_data_dir, rendered_data_dir, output_di
         logging.info(f"Processing scene: {scene_id}")
 
         # Define source directories
+        # Try both possible directory names (rgb_resized_undistorted for rendered data, resized_undistorted_images for raw data)
+        color_dir = os.path.join(rendered_data_dir, scene_id, 'dslr', 'rgb_resized_undistorted')
+        if not os.path.isdir(color_dir):
+            color_dir = os.path.join(rendered_data_dir, scene_id, 'dslr', 'resized_undistorted_images')
+        
         camera_dir = os.path.join(rendered_data_dir, scene_id, 'dslr', 'camera')
         depth_dir = os.path.join(rendered_data_dir, scene_id, 'dslr', 'render_depth')
-        color_dir = os.path.join(rendered_data_dir, scene_id, 'dslr', 'rgb_resized_undistorted')
 
         # Check if all source directories exist
         if not os.path.exists(camera_dir) or not os.path.exists(depth_dir) or not os.path.exists(color_dir):

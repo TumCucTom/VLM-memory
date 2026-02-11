@@ -41,9 +41,13 @@ def process_scene(scene_id, raw_data_dir, rendered_data_dir, output_dir, height,
         return
 
     # get image path
+    # Try both possible directory names (rgb_resized_undistorted for rendered data, resized_undistorted_images for raw data)
     image_dir = os.path.join(rendered_data_dir, scene_id, 'dslr', 'rgb_resized_undistorted')
     if not os.path.isdir(image_dir):
-        logging.error(f"Image directory not found for scene {scene_id} at {image_dir}")
+        # Fallback to the actual directory name in downloaded data
+        image_dir = os.path.join(rendered_data_dir, scene_id, 'dslr', 'resized_undistorted_images')
+    if not os.path.isdir(image_dir):
+        logging.error(f"Image directory not found for scene {scene_id}. Tried: rgb_resized_undistorted and resized_undistorted_images")
         return
 
     images_train_paths = sorted([os.path.join(image_dir, f) for f in train_list])
