@@ -194,6 +194,10 @@ class ModelArguments:
     ## memory components (dual memory system)
     tune_memory_components: bool = field(default=False, metadata={"help": "Enable training of memory components (working_attention, episodic_attention, memory_fusion_mlp, salience_gate)"})
     memory_mode: str = field(default="working_only", metadata={"help": "Memory training mode: 'working_only', 'episodic_only', or 'both' (default: working_only)"})
+    memory_L_w: int = field(default=8, metadata={"help": "Working memory capacity (L_w)"})
+    memory_L_e: int = field(default=32, metadata={"help": "Episodic memory capacity (L_e)"})
+    memory_num_heads: int = field(default=8, metadata={"help": "Number of attention heads for memory"})
+    memory_dropout: float = field(default=0.1, metadata={"help": "Dropout for memory modules"})
     memory_lora_r: int = field(default=64, metadata={"help": "LoRA rank for memory attention modules"})
     memory_lora_alpha: int = field(default=128, metadata={"help": "LoRA alpha for memory attention modules"})
 
@@ -370,21 +374,16 @@ def get_mm_adapter_state_maybe_zero_3(named_params, keys_to_match):
 def find_all_linear_names(model, include_memory_components=False):
     """
     Find all linear layer names for LoRA targeting.
-    
-    Args:
-        model: The model to search
-        include_memory_components: If True, include memory attention modules in LoRA targets
-            Note: Memory attention modules (MultiheadAttention) are small and will be trained fully,
-            not via LoRA, as PEFT LoRA targets Linear layers, not MultiheadAttention directly.
+    Memory modules are never included in LoRA targets; they are always trained fully (no LoRA).
     """
     cls = torch.nn.Linear
     lora_module_names = set()
     multimodal_keywords = ['mm_projector', 'vision_tower', 'vision_resampler', 'spatial_tower', 'fusion_block']
-    
-    # Always exclude memory components from LoRA targets
-    # Memory attention modules will be trained fully (they're small)
-    # Memory fusion MLP and salience gate will also be trained fully
-    multimodal_keywords.extend(['memory_fusion_mlp', 'salience_gate', 'working_attention', 'episodic_attention'])
+    # Exclude all memory components from LoRA: train memory fully (no LoRA)
+    multimodal_keywords.extend([
+        'memory_fusion_mlp', 'salience_gate', 'working_attention', 'episodic_attention',
+        'working_memory', 'episodic_memory',
+    ])
     
     for name, module in model.named_modules():
         if any(mm_keyword in name for mm_keyword in multimodal_keywords):
@@ -1937,6 +1936,7 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
             model_args.mm_spatial_pool_out_channels is not None,
             model_args.mm_spatial_pool_mode is not None,
             model_args.mm_resampler_type is not None,
+            model_args.vision_tower is not None,  # need config for memory sizes when using vision
         ]
     ):
         cfg_pretrained = AutoConfig.from_pretrained(model_args.model_name_or_path)
@@ -1976,6 +1976,10 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
 
     if model_args.fusion_block is not None:
         overwrite_config["fusion_block"] = model_args.fusion_block
+
+    if model_args.vision_tower is not None:
+        overwrite_config["working_memory_size"] = getattr(model_args, "memory_L_w", 8)
+        overwrite_config["episodic_memory_size"] = getattr(model_args, "memory_L_e", 32)
 
     if overwrite_config:
         assert cfg_pretrained is not None, "cfg_pretrained is None"
@@ -2315,10 +2319,10 @@ def train(attn_implementation=None):
                 for p in model.get_model().vision_resampler.parameters():
                     p.requires_grad = True
             
-            # Phase 1: Make memory components trainable
+            # Phase 1: Make memory components trainable (full training, no LoRA)
             if model_args.tune_memory_components:
                 memory_mode = getattr(model_args, 'memory_mode', 'working_only').lower()
-                rank0_print(f"Making memory components trainable (mode: {memory_mode})...")
+                rank0_print(f"Making memory components trainable (mode: {memory_mode}) — full training, no LoRA...")
                 model_base = model.get_model()
                 
                 # Determine which components to train based on memory_mode
@@ -2404,6 +2408,7 @@ def train(attn_implementation=None):
         else:
             rank0_print(f"Using mm_tunable_parts: {model_args.mm_tunable_parts}")
             model.config.mm_tunable_parts = training_args.mm_tunable_parts = model_args.mm_tunable_parts
+            model.config.memory_mode = getattr(model_args, "memory_mode", "working_only")
             # Set the entire model to not require gradients by default
             model.requires_grad_(False)
             vision_tower.requires_grad_(False)
@@ -2431,6 +2436,33 @@ def train(attn_implementation=None):
             if "fusion_block" in tunable_parts:
                 for p in model.get_fusion_block().parameters():
                     p.requires_grad = True
+            if "dual_memory" in tunable_parts:
+                memory_mode = getattr(model_args, "memory_mode", "working_only").lower()
+                rank0_print(f"Unfreezing memory components (mode: {memory_mode}) — full training, no LoRA...")
+                model_base = model.get_model()
+                train_working = memory_mode in ["working_only", "both"]
+                train_episodic = memory_mode in ["episodic_only", "both"]
+                train_fusion = memory_mode == "both"
+                if train_working and hasattr(model_base, "working_attention"):
+                    for p in model_base.working_attention.parameters():
+                        p.requires_grad = True
+                    rank0_print("  - working_attention: trainable")
+                if train_working and hasattr(model_base, "working_memory"):
+                    for p in model_base.working_memory.parameters():
+                        p.requires_grad = True
+                    rank0_print("  - working_memory: trainable")
+                if train_episodic and hasattr(model_base, "episodic_attention"):
+                    for p in model_base.episodic_attention.parameters():
+                        p.requires_grad = True
+                    rank0_print("  - episodic_attention: trainable")
+                if train_episodic and hasattr(model_base, "episodic_memory"):
+                    for p in model_base.episodic_memory.parameters():
+                        p.requires_grad = True
+                    rank0_print("  - episodic_memory: trainable")
+                if train_fusion and hasattr(model_base, "memory_fusion_mlp"):
+                    for p in model_base.memory_fusion_mlp.parameters():
+                        p.requires_grad = True
+                    rank0_print("  - memory_fusion_mlp: trainable")
 
         total_params = sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in model.parameters())
         trainable_params = sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in model.parameters() if p.requires_grad)
