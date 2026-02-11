@@ -1,0 +1,13 @@
+# Generated for step 1.2: render DSLR depth from mesh (ScanNet++ toolbox)
+# data_root: ScanNet++ root containing data/ and splits/ (e.g. .../raw_data/scannetpp)
+data_root: DATA_ROOT_PLACEHOLDER
+
+render_iphone: False
+render_dslr: True
+
+splits: [nvs_sem_train, nvs_sem_val]
+
+near: 0.05
+far: 20.0
+
+# Output goes to data_root/data/<scene_id>/dslr/render_depth and render_rgb by default
