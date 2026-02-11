@@ -37,22 +37,6 @@ conda activate vlm3r
 # Change to project directory
 cd /home/u5fj/trvbale.u5fj/scratch/VLM-memory
 
-# Install missing dependencies
-echo "Installing missing dependencies..."
-pip install omegaconf --quiet
-
-# Try to fix bitsandbytes CUDA support by installing from conda-forge
-# conda-forge may have aarch64 builds with CUDA support
-echo "Checking bitsandbytes CUDA support..."
-if python -c "import bitsandbytes; from bitsandbytes.cextension import COMPILED_WITH_CUDA; exit(0 if COMPILED_WITH_CUDA else 1)" 2>/dev/null; then
-    echo "bitsandbytes has CUDA support"
-else
-    echo "WARNING: bitsandbytes compiled without CUDA support. Installing from conda-forge..."
-    pip uninstall bitsandbytes -y --quiet 2>/dev/null || true
-    # Try installing from conda-forge which may have aarch64 CUDA builds
-    conda install -c conda-forge bitsandbytes -y --quiet || \
-    echo "NOTE: conda-forge installation failed, may need manual compilation"
-fi
 
 # Install llava package in editable mode if not already installed
 if ! python -c "import llava; from llava.model import LlavaLlamaForCausalLM" 2>/dev/null; then
