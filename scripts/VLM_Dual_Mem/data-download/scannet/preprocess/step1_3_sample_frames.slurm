@@ -2,13 +2,12 @@
 #SBATCH --job-name=scannet_sample_frames
 #SBATCH --output=logs/scannet_sample_frames_%j.out
 #SBATCH --error=logs/scannet_sample_frames_%j.err
-#SBATCH --time=72:00:00
+#SBATCH --time=24:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=128G
-#SBATCH --partition=mlcnu
-#SBATCH --account=coms037985
+#SBATCH --partition=workq
 
 # Print job information
 echo "Job ID: $SLURM_JOB_ID"
@@ -17,11 +16,9 @@ echo "Node: $SLURM_NODELIST"
 echo "Start Time: $(date)"
 echo "Working Directory: $(pwd)"
 
-# Change to project directory
-cd ~/VLM-memory
-
 # Activate Python virtual environment
-source ~/venvs/vlm3r/bin/activate
+source ~/miniforge3/bin/activate
+conda activate vlm3r
 
 # Create logs directory if it doesn't exist
 mkdir -p logs

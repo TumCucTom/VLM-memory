@@ -17,11 +17,9 @@ echo "Node: $SLURM_NODELIST"
 echo "Start Time: $(date)"
 echo "Working Directory: $(pwd)"
 
-# Change to project directory
-cd ~/VLM-memory
-
 # Activate Python virtual environment
-source ~/venvs/vlm3r/bin/activate
+source ~/miniforge3/bin/activate
+conda activate vlm3r
 
 # Create logs directory if it doesn't exist
 mkdir -p logs

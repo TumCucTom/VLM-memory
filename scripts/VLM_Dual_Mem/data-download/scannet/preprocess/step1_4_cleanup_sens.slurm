@@ -17,8 +17,6 @@ echo "Node: $SLURM_NODELIST"
 echo "Start Time: $(date)"
 echo "Working Directory: $(pwd)"
 
-# Change to project directory
-cd ~/VLM-memory
 
 # Create logs directory if it doesn't exist
 mkdir -p logs
