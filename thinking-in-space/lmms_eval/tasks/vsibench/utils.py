@@ -124,42 +124,86 @@ def vsibench_process_results(doc, results):
 
     return {"vsibench_score": doc}
 
-def vsibench_aggregate_results(results):
-    results = pd.DataFrame(results)
-    output = {}
+def _to_native(v):
+    """Convert numpy scalars/arrays to native Python so pd.DataFrame doesn't raise TypeError."""
+    if isinstance(v, (np.floating, np.integer)):
+        return float(v) if isinstance(v, np.floating) else int(v)
+    if hasattr(v, "item") and getattr(v, "ndim", 1) == 0:
+        return v.item()
+    if isinstance(v, np.ndarray):
+        if v.ndim == 0:
+            return v.item()
+        return v.tolist()
+    if isinstance(v, (list, tuple)):
+        return [_to_native(x) for x in v]
+    if isinstance(v, (np.str_, np.bytes_)):
+        return str(v)
+    return v
 
-    for question_type, question_type_indexes in results.groupby('question_type').groups.items():
-        per_question_type = results.iloc[question_type_indexes]
-        
+
+def _doc_to_native(doc):
+    """Convert numpy scalars in a result doc to native Python so aggregation doesn't raise."""
+    return {str(k): _to_native(v) for k, v in doc.items()}
+
+
+def vsibench_aggregate_results(results):
+    """Aggregate without pandas to avoid TypeError from ensure_index on gathered data."""
+    normalized = [_doc_to_native(d) for d in results]
+    by_type = {}
+    for doc in normalized:
+        qt = doc.get("question_type")
+        if qt is None:
+            continue
+        if qt not in by_type:
+            by_type[qt] = []
+        by_type[qt].append(doc)
+
+    output = {}
+    for question_type, docs in by_type.items():
         if question_type in MCA_QUESTION_TYPES:
             for metric in METRICS_FOR_MCA.keys():
-                output[f"{question_type}_{metric}"] = per_question_type[metric].mean()
+                vals = [d.get(metric) for d in docs if d.get(metric) is not None]
+                output[f"{question_type}_{metric}"] = sum(vals) / len(vals) if vals else 0.0
         elif question_type in NA_QUESTION_TYPES:
             for metric in METRICS_FOR_NA.keys():
-                if metric == 'success_rate':
-                    output[f"{question_type}_{metric}"] = per_question_type[metric].mean()
-                else:
-                    output[f"{question_type}_{metric}"] = per_question_type[metric].mean()
-
+                vals = [d.get(metric) for d in docs if d.get(metric) is not None]
+                output[f"{question_type}_{metric}"] = sum(vals) / len(vals) if vals else 0.0
         else:
             raise ValueError(f"Unknown question type: {question_type}")
-    
+
     object_rel_direction_tasks = [
-        'object_rel_direction_easy',
-        'object_rel_direction_medium',
-        'object_rel_direction_hard',
+        "object_rel_direction_easy",
+        "object_rel_direction_medium",
+        "object_rel_direction_hard",
     ]
-    
-    # 计算方向相关任务的平均准确率
     direction_accuracies = []
     for task in object_rel_direction_tasks:
-        accuracy_key = f'{task}_accuracy'
+        accuracy_key = f"{task}_accuracy"
         if accuracy_key in output:
             direction_accuracies.append(output.pop(accuracy_key))
-    
-    if direction_accuracies:  # 只在有结果时计算平均值
-        output['object_rel_direction_accuracy'] = sum(direction_accuracies) / len(direction_accuracies)
-    
-    output['overall'] = sum([_ for _ in output.values()]) / len(output)
-    eval_logger.info(f"Evaluation results: {output}")
-    return output['overall'] * 100.
+    if direction_accuracies:
+        output["object_rel_direction_accuracy"] = sum(direction_accuracies) / len(direction_accuracies)
+
+    # Table 1: 8 categories (Obj. Count, Abs. Dist., Obj. Size, Room Size, Rel. Dist., Rel. Dir., Route Plan, Appr. Order)
+    category_scores = [
+        ("Obj. Count", output.get("object_counting_MRA:.5:.95:.05")),
+        ("Abs. Dist.", output.get("object_abs_distance_MRA:.5:.95:.05")),
+        ("Obj. Size", output.get("object_size_estimation_MRA:.5:.95:.05")),
+        ("Room Size", output.get("room_size_estimation_MRA:.5:.95:.05")),
+        ("Rel. Dist.", output.get("object_rel_distance_accuracy")),
+        ("Rel. Dir.", output.get("object_rel_direction_accuracy")),
+        ("Route Plan", output.get("route_planning_accuracy")),
+        ("Appr. Order", output.get("obj_appearance_order_accuracy")),
+    ]
+    eight_cats = [v for _, v in category_scores if v is not None]
+    paper_avg = sum(eight_cats) / len(eight_cats) if eight_cats else 0.0
+
+    eval_logger.info("VSI-Bench category scores (paper Table 1):")
+    for name, val in category_scores:
+        pct = val * 100.0 if val is not None else None
+        eval_logger.info(f"  {name}: {pct:.2f}%" if pct is not None else f"  {name}: N/A")
+    eval_logger.info(f"Average (8 categories): {paper_avg * 100.0:.2f}%")
+    eval_logger.info(f"Evaluation results (all keys): {output}")
+
+    output["overall"] = paper_avg if eight_cats else (sum(output.values()) / len(output) if output else 0.0)
+    return output["overall"] * 100.0

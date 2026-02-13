@@ -81,6 +81,7 @@ class Vlm3r(lmms):
         tie_weights: bool = True,
         model_name: str = None,
         model_base: str = None,
+        use_dual_memory: bool = True,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -125,6 +126,7 @@ class Vlm3r(lmms):
             overwrite_config["mm_newline_position"] = self.mm_newline_position
             overwrite_config["add_faster_video"] = False
             overwrite_config["delay_load"] = self.delay_load
+            overwrite_config["use_dual_memory"] = use_dual_memory
             # overwrite_config["attn_implementation"] = attn_implementation
 
             cfg_pretrained = AutoConfig.from_pretrained(self.pretrained)

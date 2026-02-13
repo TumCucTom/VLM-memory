@@ -1,6 +1,5 @@
 from typing import Callable, Dict
 
-import evaluate as hf_evaluate
 from loguru import logger as eval_logger
 
 from lmms_eval.api.model import lmms
@@ -114,6 +113,7 @@ def get_metric(name: str, hf_evaluate_metric=False) -> Callable:
             eval_logger.warning(f"Could not find registered metric '{name}' in lm-eval, searching in HF Evaluate library...")
 
     try:
+        import evaluate as hf_evaluate
         metric_object = hf_evaluate.load(name)
         return metric_object.compute
     except Exception:

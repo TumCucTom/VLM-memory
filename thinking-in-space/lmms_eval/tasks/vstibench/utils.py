@@ -123,26 +123,87 @@ def vsibench_process_results(doc, results):
 
     return {"vsibench_score": doc}
 
-def vsibench_aggregate_results(results):
-    results = pd.DataFrame(results)
-    output = {}
 
-    for question_type, question_type_indexes in results.groupby('question_type').groups.items():
-        per_question_type = results.iloc[question_type_indexes]
-        
+def _to_native(v):
+    """Convert numpy scalars/arrays to native Python so pd.DataFrame doesn't raise TypeError."""
+    if isinstance(v, (np.floating, np.integer)):
+        return float(v) if isinstance(v, np.floating) else int(v)
+    if hasattr(v, "item") and getattr(v, "ndim", 1) == 0:
+        return v.item()
+    if isinstance(v, np.ndarray):
+        if v.ndim == 0:
+            return v.item()
+        return v.tolist()
+    if isinstance(v, (list, tuple)):
+        return [_to_native(x) for x in v]
+    if isinstance(v, (np.str_, np.bytes_)):
+        return str(v)
+    return v
+
+
+def _doc_to_native(doc):
+    """Convert numpy scalars in a result doc to native Python so aggregation doesn't raise."""
+    return {str(k): _to_native(v) for k, v in doc.items()}
+
+
+def vsibench_aggregate_results(results):
+    """Aggregate without pandas to avoid TypeError from ensure_index on gathered data."""
+    normalized = [_doc_to_native(d) for d in results]
+    by_type = {}
+    for doc in normalized:
+        qt = doc.get("question_type")
+        if qt is None:
+            continue
+        if qt not in by_type:
+            by_type[qt] = []
+        by_type[qt].append(doc)
+
+    output = {}
+    for question_type, docs in by_type.items():
         if question_type in MCA_QUESTION_TYPES:
             for metric in METRICS_FOR_MCA.keys():
-                output[f"{question_type}_{metric}"] = per_question_type[metric].mean()
+                vals = [d.get(metric) for d in docs if d.get(metric) is not None]
+                output[f"{question_type}_{metric}"] = sum(vals) / len(vals) if vals else 0.0
         elif question_type in NA_QUESTION_TYPES:
             for metric in METRICS_FOR_NA.keys():
-                if metric == 'success_rate':
-                    output[f"{question_type}_{metric}"] = per_question_type[metric].mean()
-                else:
-                    output[f"{question_type}_{metric}"] = per_question_type[metric].mean()
-
+                vals = [d.get(metric) for d in docs if d.get(metric) is not None]
+                output[f"{question_type}_{metric}"] = sum(vals) / len(vals) if vals else 0.0
         else:
             raise ValueError(f"Unknown question type: {question_type}")
-    
-    output['overall'] = sum([_ for _ in output.values()]) / len(output)
-    eval_logger.info(f"Evaluation results: {output}")
-    return output['overall'] * 100.
+
+    # Full average: mean of all per-sub-type metrics (9 sub-types)
+    all_subtype_vals = [v for k, v in output.items() if k != "overall"]
+    full_average = sum(all_subtype_vals) / len(all_subtype_vals) if all_subtype_vals else 0.0
+
+    # Paper Table 2: 5 category scores (Cam-Obj Abs., Cam. Displace., Cam. Mov. Dir., Obj-Obj Rel. Pos., Cam-Obj Rel. Dist.)
+    cat_cam_abs = output.get("camera_obj_abs_dist_MRA:.5:.95:.05")
+    cat_cam_disp = output.get("camera_displacement_MRA:.5:.95:.05")
+    cat_cam_mov = output.get("camera_movement_direction_accuracy")
+    obj_obj_vals = [output.get(f"obj_obj_relative_pos_{x}_accuracy") for x in ("nf", "ud", "lr")]
+    obj_obj_present = [v for v in obj_obj_vals if v is not None]
+    cat_obj_obj = sum(obj_obj_present) / len(obj_obj_present) if obj_obj_present else None
+    cam_rel_vals = [output.get(f"camera_obj_rel_dist_v{x}_accuracy") for x in (1, 2, 3)]
+    cam_rel_present = [v for v in cam_rel_vals if v is not None]
+    cat_cam_obj_rel = sum(cam_rel_present) / len(cam_rel_present) if cam_rel_present else None
+
+    category_scores = [
+        ("Cam-Obj Abs. Dist.", cat_cam_abs),
+        ("Cam. Displace.", cat_cam_disp),
+        ("Cam. Mov. Dir.", cat_cam_mov),
+        ("Obj-Obj Rel. Pos.", cat_obj_obj),
+        ("Cam-Obj Rel. Dist.", cat_cam_obj_rel),
+    ]
+    five_cats = [v for _, v in category_scores if v is not None]
+    paper_average = sum(five_cats) / len(five_cats) if five_cats else 0.0
+
+    eval_logger.info("VSTiBench category scores (paper Table 2):")
+    for name, val in category_scores:
+        pct = val * 100.0 if val is not None else None
+        eval_logger.info(f"  {name}: {pct:.2f}%" if pct is not None else f"  {name}: N/A")
+    eval_logger.info(f"Full average (all sub-types): {full_average * 100.0:.2f}%")
+    eval_logger.info(f"Paper average (5 categories): {paper_average * 100.0:.2f}%")
+    eval_logger.info(f"Evaluation results (all keys): {output}")
+
+    output["overall"] = paper_average
+    output["overall_full"] = full_average
+    return output["overall"] * 100.0

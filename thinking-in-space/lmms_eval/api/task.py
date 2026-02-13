@@ -935,6 +935,63 @@ class ConfigurableTask(Task):
                 dataset_kwargs.pop("cache_dir")
                 dataset_kwargs.pop("video")
 
+            # Custom loader for Journey9ni/vstibench: repo test.json has inconsistent column types (object vs array), so load and normalize instead of load_dataset()
+            if self.DATASET_PATH == "Journey9ni/vstibench":
+                cache_path = snapshot_download(
+                    repo_id=self.DATASET_PATH,
+                    repo_type="dataset",
+                    force_download=False,
+                    local_files_only=True,
+                )
+                json_path = os.path.join(cache_path, "test.json")
+                with open(json_path) as f:
+                    raw = json.load(f)
+                if isinstance(raw, list):
+                    rows = raw
+                elif isinstance(raw, dict) and all(isinstance(v, list) for v in raw.values()):
+                    # column-oriented
+                    rows = [dict(zip(raw.keys(), v)) for v in zip(*raw.values())]
+                else:
+                    rows = raw.get("test", raw) if isinstance(raw, dict) else raw
+                    if not isinstance(rows, list):
+                        rows = list(rows) if hasattr(rows, "__iter__") else [raw]
+                # Normalize: Arrow fails when same column is sometimes object sometimes array; make objects into single-element lists
+                for row in rows:
+                    for k in list(row.keys()):
+                        v = row[k]
+                        if isinstance(v, dict) and not isinstance(v, list):
+                            row[k] = [v]
+                self.dataset = datasets.DatasetDict(
+                    {"test": datasets.Dataset.from_list(rows)}
+                )
+                if self.config.process_docs is not None:
+                    for split in self.dataset:
+                        if split in [
+                            self.config.training_split,
+                            self.config.validation_split,
+                            self.config.test_split,
+                            self.config.fewshot_split,
+                        ]:
+                            self.dataset[split] = self.config.process_docs(
+                                self.dataset[split]
+                            )
+                self.dataset_no_image = self.dataset.copy()
+                for doc_name in self.dataset_no_image:
+                    remove_cols = []
+                    features = self.dataset_no_image[doc_name].features
+                    for feature in features:
+                        if isinstance(features[feature], Image):
+                            remove_cols.append(feature)
+                        elif isinstance(features[feature], Sequence) and isinstance(
+                            features[feature].feature, Image
+                        ):
+                            remove_cols.append(feature)
+                    for remove_col in remove_cols:
+                        self.dataset_no_image[doc_name] = (
+                            self.dataset_no_image[doc_name].remove_columns(remove_col)
+                        )
+                return
+
             if "builder_script" in dataset_kwargs:
                 builder_script = dataset_kwargs["builder_script"]
                 self.DATASET_PATH = os.path.join(cache_path, builder_script)
