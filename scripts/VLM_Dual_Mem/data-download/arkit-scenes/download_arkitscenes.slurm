@@ -33,13 +33,12 @@ echo "Pandas available: $(python -c 'import pandas; print(pandas.__version__)' 2
 echo ""
 
 # Change to project directory
-cd ~/VLM-memory
-
-# Create logs directory if it doesn't exist
+PROJECT_DIR="${PROJECT_DIR:-/home/u5fj/trvbale.u5fj/scratch/VLM-memory}"
+cd "$PROJECT_DIR"
 mkdir -p logs
 
 # Run the download script
-bash scripts/VLM_Dual_Mem/download_arkitscenes.sh
+bash scripts/VLM_Dual_Mem/data-download/arkit-scenes/download_arkitscenes.sh
 
 echo ""
 echo "=========================================="
