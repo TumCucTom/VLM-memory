@@ -847,8 +847,12 @@ class LlavaMetaForCausalLM(ABC):
         # H_t = image_features (current frame features after projection)
         # Retrieve from working memory and update
         # Call through get_model() since _apply_dual_memory is in LlavaMetaModel
-        if (self.get_model().get_working_memory() is not None or 
-            self.get_model().get_episodic_memory() is not None):
+        # Skip when use_dual_memory=False (e.g. for evaluation without memory)
+        use_dual_memory = getattr(self.get_model().config, "use_dual_memory", True)
+        if use_dual_memory and (
+            self.get_model().get_working_memory() is not None or
+            self.get_model().get_episodic_memory() is not None
+        ):
             image_features = self.get_model()._apply_dual_memory(image_features)
         
         return image_features
