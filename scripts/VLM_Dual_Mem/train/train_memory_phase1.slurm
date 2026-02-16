@@ -2,17 +2,17 @@
 #SBATCH --job-name=vlm3r_memory_phase1
 #SBATCH --output=logs/train_memory_phase1_%j.out
 #SBATCH --error=logs/train_memory_phase1_%j.err
-#SBATCH --time=7-00:00:00
+#SBATCH --time=1-00:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
-#SBATCH --mem=400G
-#SBATCH --gres=gpu:a100-sxm4-40gb:4
-#SBATCH --partition=mlcnu
-#SBATCH --account=coms037985
+#SBATCH --mem=200G
+#SBATCH --gres=gpu:1
+#SBATCH --partition=workq
+#SBATCH --account=brics.u5fj
 
 # Load CUDA module for bitsandbytes compatibility
-module load cuda/12.4.1
+# module load cuda/12.4.1
 
 # Set LD_LIBRARY_PATH to include CUDA libraries
 export LD_LIBRARY_PATH=/usr/local/cuda-12.4/lib64:$LD_LIBRARY_PATH
@@ -56,7 +56,7 @@ export TOKENIZERS_PARALLELISM=false
 
 # Set NUM_GPUS_PER_NODE to match allocated GPUs (4 A100s per node)
 # The training script will use this environment variable if set, otherwise defaults to 4
-export NUM_GPUS_PER_NODE=4
+export NUM_GPUS_PER_NODE=1
 
 # Run the Phase 1 training script
 bash scripts/VLM_Dual_Mem/train_memory_phase1.sh

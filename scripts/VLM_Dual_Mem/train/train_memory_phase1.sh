@@ -17,7 +17,7 @@ MASTER_PORT=30000
 # Set up the data folder
 IMAGE_FOLDER="data/vlm_3r_data"
 VIDEO_FOLDER="data/vlm_3r_data"
-DATA_YAML="scripts/VLM_3R/vsibench_data.yaml" # e.g exp.yaml
+DATA_YAML="scripts/VLM_3R/vsibench_data_no_route_plan.yaml" # e.g exp.yaml
 SUFFIX="vlm_3r_memory_phase1_salience_gated"
 NUM_TRAIN_EPOCHS=5
 SAVE_TOTAL_LIMIT=5
@@ -32,7 +32,7 @@ TUNE_FUSION_BLOCK=False
 TUNE_MEMORY_COMPONENTS=True
 # Adjust gradient accumulation: bs=128 total, with 4 GPUs we need 32 steps per GPU
 # (was 16 for 8 GPUs: 16 * 8 = 128, now 32 * 4 = 128)
-GRADIENT_ACCUMULATION_STEPS=32 # bs=128, num_gpus=4
+GRADIENT_ACCUMULATION_STEPS=128 # bs=128, num_gpus=4
 
 ################ Arnold Jobs ################
 VISION_MODEL_VERSION="google/siglip-so400m-patch14-384"

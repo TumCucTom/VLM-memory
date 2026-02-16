@@ -6,7 +6,7 @@ set -e
 export OMP_NUM_THREADS=8
 export NCCL_IB_DISABLE=0
 export NCCL_IB_GID_INDEX=3
-export NCCL_SOCKET_IFNAME=eth0
+unset NCCL_SOCKET_IFNAME 2>/dev/null || true
 export NCCL_DEBUG=INFO
 
 # Model
@@ -31,8 +31,8 @@ BATCH_SIZE=1
 GRADIENT_ACCUMULATION_STEPS=16
 SAVE_TOTAL_LIMIT=3
 
-# Data (same layout as phase1 – adjust if your paths differ)
-DATA_YAML="scripts/VLM_3R/vsibench_data.yaml"
+# Data (same layout as phase1 – adjust if your paths differ; slurm can override via DATA_YAML)
+DATA_YAML="${DATA_YAML:-scripts/VLM_3R/vsibench_data.yaml}"
 IMAGE_FOLDER="data/vlm_3r_data"
 VIDEO_FOLDER="data/vlm_3r_data"
 
@@ -48,13 +48,18 @@ echo "Output: ${OUTPUT_DIR}"
 echo "=========================================="
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+# Repo root (script is scripts/VLM_Dual_Mem/train/*.sh)
+PROJECT_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 cd "$PROJECT_DIR"
 
-ACCELERATE_CPU_AFFINITY=1 torchrun \
+# Multinode: set NNODES and NODE_RANK (e.g. by Slurm srun); MASTER_ADDR and MASTER_PORT set by job script
+NNODES=${NNODES:-1}
+NODE_RANK=${NODE_RANK:-0}
+# Disable CPU affinity to avoid requiring pynvml on compute nodes (can set to 1 if pynvml is available later)
+ACCELERATE_CPU_AFFINITY=0 torchrun \
     --nproc_per_node=${NUM_GPUS_PER_NODE:-${NUM_GPUS:-1}} \
-    --nnodes=1 \
-    --node_rank=0 \
+    --nnodes=${NNODES} \
+    --node_rank=${NODE_RANK} \
     --master_addr=${MASTER_ADDR:-localhost} \
     --master_port=${MASTER_PORT:-29500} \
     llava/train/train.py \
@@ -98,7 +103,8 @@ ACCELERATE_CPU_AFFINITY=1 torchrun \
     --per_device_eval_batch_size 4 \
     --gradient_accumulation_steps ${GRADIENT_ACCUMULATION_STEPS} \
     --evaluation_strategy "no" \
-    --save_strategy "epoch" \
+    --save_strategy "steps" \
+    --save_steps 500 \
     --save_total_limit ${SAVE_TOTAL_LIMIT} \
     --learning_rate ${LEARNING_RATE} \
     --weight_decay 0. \
