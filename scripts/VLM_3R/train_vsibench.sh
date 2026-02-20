@@ -10,7 +10,8 @@ MASTER_PORT=30000
 # Set up the data folder
 IMAGE_FOLDER="data/vlm_3r_data"
 VIDEO_FOLDER="data/vlm_3r_data"
-DATA_YAML="scripts/VLM_3R/vsibench_data.yaml" # e.g exp.yaml
+# Use _valid.yaml so only samples with existing video paths are loaded (avoids multi-GPU collective mismatch)
+DATA_YAML="${DATA_YAML:-scripts/VLM_3R/vsibench_data_valid.yaml}"
 SUFFIX="vlm_3r_vsibench_all_tokens_cross_attn_lora"
 NUM_TRAIN_EPOCHS=5
 SAVE_TOTAL_LIMIT=5

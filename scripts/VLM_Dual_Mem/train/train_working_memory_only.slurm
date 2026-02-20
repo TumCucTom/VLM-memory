@@ -53,8 +53,8 @@ export PYTHONWARNINGS=ignore
 export TOKENIZERS_PARALLELISM=false
 export NUM_GPUS_PER_NODE=${SLURM_GPUS_ON_NODE:-4}
 
-# Use vsibench without route-plan data
-export DATA_YAML="scripts/VLM_3R/vsibench_data_no_route_plan.yaml"
+# Use filtered vsibench (scannet + scannetpp + route_plan); only samples with existing videos
+export DATA_YAML="scripts/VLM_3R/vsibench_data_valid.yaml"
 
 # Multinode: first node is master; srun runs one task per node so each gets correct NODE_RANK
 if [ "${SLURM_NNODES:-1}" -gt 1 ]; then

@@ -9,8 +9,9 @@ export NCCL_IB_GID_INDEX=3
 unset NCCL_SOCKET_IFNAME 2>/dev/null || true
 export NCCL_DEBUG=INFO
 
-# Model
+# Model: base VLM + optional task LoRA (e.g. VLM-3R) to load/merge before training
 MODEL_PATH="lmms-lab/LLaVA-NeXT-Video-7B-Qwen2"
+TASK_LORA_PATH="${TASK_LORA_PATH:-Journey9ni/vlm-3r-llava-qwen2-lora}"
 VISION_MODEL_VERSION="google/siglip-so400m-patch14-384"
 SPATIAL_TOWER="cut3r"
 SPATIAL_TOWER_SELECT_FEATURE="patch_tokens"
@@ -65,6 +66,7 @@ ACCELERATE_CPU_AFFINITY=0 torchrun \
     llava/train/train.py \
     --deepspeed scripts/zero2.json \
     --model_name_or_path "${MODEL_PATH}" \
+    --lora_weight_path "${TASK_LORA_PATH}" \
     --lora_enable False \
     --version qwen_1_5 \
     --data_path "${DATA_YAML}" \

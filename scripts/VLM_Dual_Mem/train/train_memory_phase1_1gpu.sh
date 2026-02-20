@@ -16,7 +16,7 @@ MASTER_PORT=30000
 # Set up the data folder
 IMAGE_FOLDER="data/vlm_3r_data"
 VIDEO_FOLDER="data/vlm_3r_data"
-DATA_YAML="scripts/VLM_3R/vsibench_data.yaml" # e.g exp.yaml
+DATA_YAML="${DATA_YAML:-scripts/VLM_3R/vsibench_data_valid.yaml}" # filtered paths; override to use unfiltered
 # Add suffix based on number of GPUs
 SUFFIX="vlm_3r_memory_phase1_salience_gated_1gpu"
 NUM_TRAIN_EPOCHS=5
