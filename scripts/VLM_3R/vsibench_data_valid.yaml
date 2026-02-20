@@ -1,0 +1,6 @@
+# Same as vsibench_data.yaml but uses *_valid.json (only samples with existing video paths).
+# Generate with: python scripts/VLM_3R/filter_vsibench_valid_paths.py
+datasets:
+  - json_path: data/vlm_3r_data/vsibench/merged_qa_scannet_train_valid.json
+  - json_path: data/vlm_3r_data/vsibench/merged_qa_scannetpp_train_valid.json
+  - json_path: data/vlm_3r_data/vsibench/merged_qa_route_plan_train_valid.json

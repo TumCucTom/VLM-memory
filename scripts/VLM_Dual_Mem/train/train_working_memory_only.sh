@@ -31,6 +31,8 @@ LEARNING_RATE=1e-4
 BATCH_SIZE=1
 GRADIENT_ACCUMULATION_STEPS=16
 SAVE_TOTAL_LIMIT=3
+# Resume: set RESUME_FROM_CHECKPOINT=true (or path to checkpoint) to resume; default is no resume
+RESUME_FROM_CHECKPOINT="${RESUME_FROM_CHECKPOINT:-}"
 
 # Data (same layout as phase1 – adjust if your paths differ; slurm can override via DATA_YAML)
 DATA_YAML="${DATA_YAML:-scripts/VLM_3R/vsibench_data.yaml}"
@@ -100,6 +102,7 @@ ACCELERATE_CPU_AFFINITY=0 torchrun \
     --bf16 True \
     --run_name ${RUN_NAME} \
     --output_dir ${OUTPUT_DIR} \
+    $([[ -n "${RESUME_FROM_CHECKPOINT}" ]] && echo --resume_from_checkpoint "${RESUME_FROM_CHECKPOINT}") \
     --num_train_epochs ${NUM_TRAIN_EPOCHS} \
     --per_device_train_batch_size ${BATCH_SIZE} \
     --per_device_eval_batch_size 4 \
