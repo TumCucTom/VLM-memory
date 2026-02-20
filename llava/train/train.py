@@ -2135,6 +2135,16 @@ def train(attn_implementation=None):
 
     model = get_model(model_args, training_args, bnb_model_from_pretrained_args)
     model.config.use_cache = False
+
+    # Load and merge task LoRA (e.g. VLM-3R) so we always train on top of it
+    if getattr(training_args, "lora_weight_path", None) and (s := (training_args.lora_weight_path or "").strip()):
+        from peft import PeftModel
+        rank0_print(f"Loading task LoRA from {s}...")
+        model = PeftModel.from_pretrained(model, s, is_trainable=False)
+        rank0_print("Merging task LoRA into base model...")
+        model = model.merge_and_unload()
+        rank0_print("Task LoRA merged; training will run on top of this model.")
+
     if model_args.rope_scaling_factor is not None and model_args.rope_scaling_type is not None:
         model.config.rope_scaling = {
             "factor": model_args.rope_scaling_factor,
@@ -2499,10 +2509,8 @@ def train(attn_implementation=None):
     data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
     trainer = LLaVATrainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
 
-    if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
-        trainer.train(resume_from_checkpoint=True)
-    else:
-        trainer.train()
+    # Only resume when explicitly requested (e.g. --resume_from_checkpoint True or a path)
+    trainer.train()
     trainer.save_state()
 
     model.config.use_cache = True
