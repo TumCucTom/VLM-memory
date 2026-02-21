@@ -31,7 +31,17 @@ import random
 import yaml
 import math
 import re
+import multiprocessing
 import torch
+
+# Init NCCL process group with long timeout before DeepSpeed is imported (DeepSpeed inits with 10 min default otherwise)
+if os.environ.get("RANK") is not None and not torch.distributed.is_initialized():
+    import datetime
+    _hours = int(os.environ.get("VLM_NCCL_TIMEOUT_HOURS", "24"))
+    _timeout = datetime.timedelta(hours=_hours)
+    torch.distributed.init_process_group(backend="nccl", timeout=_timeout)
+    # Force backend to use our timeout (ProcessGroupNCCL watchdog can ignore init timeout; see PyTorch #104506)
+    torch.distributed.distributed_c10d._set_pg_timeout(_timeout)
 
 import transformers
 import tokenizers
@@ -39,6 +49,7 @@ import deepspeed
 import concurrent.futures
 
 from transformers import AutoConfig
+from transformers.trainer_callback import TrainerCallback
 from torch.utils.data import Dataset
 from llava.constants import IGNORE_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN, IMAGE_TOKEN_INDEX
 from llava.train.llava_trainer import LLaVATrainer
@@ -52,6 +63,48 @@ from llava.gt_points_load_utils import calculate_frame_timestamps
 torch.multiprocessing.set_sharing_strategy("file_system")
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+
+class FirstStepFramesCallback(TrainerCallback):
+    """After the first N steps, switch effective frames from first_step_frames to frames_upbound (avoids NCCL timeout on early steps)."""
+
+    def __init__(self, effective_frames_value, data_args):
+        self._value = effective_frames_value
+        self._normal_frames = data_args.frames_upbound
+        self._n_steps = max(1, int(getattr(data_args, "first_n_steps_frames", 1)))
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if state.global_step == self._n_steps and self._value is not None and self._normal_frames > 0:
+            self._value.value = self._normal_frames
+            if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
+                print(f"[FirstStepFrames] Switched to {self._normal_frames} frames from step {self._n_steps} onward.", flush=True)
+            elif not torch.distributed.is_initialized():
+                print(f"[FirstStepFrames] Switched to {self._normal_frames} frames from step {self._n_steps} onward.", flush=True)
+
+
+class StepProgressCallback(TrainerCallback):
+    """Log step progress from rank 0 so multi-GPU runs show advancement (progress bar can be buried)."""
+
+    def on_step_begin(self, args, state, control, **kwargs):
+        if not torch.distributed.is_initialized() or torch.distributed.get_rank() != 0:
+            return
+        step = state.global_step  # next step about to run
+        max_steps = getattr(state, "max_steps", None) or 0
+        if max_steps <= 0 or step > 5:
+            return
+        print(f"[Rank 0] Step {step}/{max_steps} starting...", flush=True)
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if not torch.distributed.is_initialized() or torch.distributed.get_rank() != 0:
+            return
+        step = state.global_step
+        max_steps = getattr(state, "max_steps", None) or 0
+        if max_steps <= 0:
+            return
+        if step <= 20 or step % 100 == 0 or step == max_steps:
+            print(f"[Rank 0] Step {step}/{max_steps} done", flush=True)
+
+
 local_rank = None
 
 IS_TOKENIZER_GREATER_THAN_0_14 = version.parse(tokenizers.__version__) >= version.parse("0.14")
@@ -259,6 +312,8 @@ class DataArguments:
     video_folder: Optional[str] = field(default=None)
     video_fps: Optional[int] = field(default=1)
     frames_upbound: Optional[int] = field(default=0)
+    first_step_frames: Optional[int] = field(default=0, metadata={"help": "If >0, use this many frames for the first N steps (see first_n_steps_frames); then use frames_upbound. 0 = disabled."})
+    first_n_steps_frames: Optional[int] = field(default=1, metadata={"help": "Number of steps to use first_step_frames before switching to frames_upbound (e.g. 3 = steps 0,1,2 use first_step_frames; step 3+ use frames_upbound)."})
     add_time_instruction: Optional[bool] = field(default=False)
     force_sample: Optional[bool] = field(default=False)
 
@@ -1096,9 +1151,11 @@ def preprocess(sources: Sequence[str], tokenizer: transformers.PreTrainedTokeniz
 
 
 class LazySupervisedDataset(Dataset):
-    def __init__(self, data_path: str, tokenizer: transformers.PreTrainedTokenizer, data_args: DataArguments):
+    def __init__(self, data_path: str, tokenizer: transformers.PreTrainedTokenizer, data_args: DataArguments, effective_frames_value=None):
         super(LazySupervisedDataset, self).__init__()
         self.tokenizer = tokenizer
+        self.data_args = data_args
+        self._effective_frames_value = effective_frames_value  # multiprocessing.Value for first-step 1 frame, rest N
         self.list_data_dict = []
 
         # Handle multiple JSON files specified in the data_path
@@ -1261,6 +1318,12 @@ class LazySupervisedDataset(Dataset):
             else:
                 length_list.append(-cur_len)
         return length_list
+
+    def _get_effective_frames_upbound(self):
+        """Current frames cap: from shared Value (first-step 1 frame) if set, else data_args.frames_upbound."""
+        if getattr(self, "_effective_frames_value", None) is not None:
+            return self._effective_frames_value.value
+        return self.data_args.frames_upbound if self.data_args.frames_upbound > 0 else 0
 
     def process_image(self, image_file, overwrite_image_aspect_ratio=None):
         image_folder = self.data_args.image_folder
@@ -1520,7 +1583,7 @@ class LazySupervisedDataset(Dataset):
 
                     # TODO: Hard CODE: Determine the indices for uniformly sampling 10 frames
                     if self.data_args.force_sample:
-                        num_frames_to_sample = self.data_args.frames_upbound
+                        num_frames_to_sample = self._get_effective_frames_upbound() or self.data_args.frames_upbound
                     else:
                         num_frames_to_sample = 10
 
@@ -1546,7 +1609,9 @@ class LazySupervisedDataset(Dataset):
                         except IOError:
                             print(f"Failed to read frame at path: {frame_path}")
                 else:
-                    video, video_time, frame_time, num_frames_to_sample = process_video_with_decord(video_file, self.data_args)
+                    video, video_time, frame_time, num_frames_to_sample = process_video_with_decord(
+                        video_file, self.data_args, num_frames_override=self._get_effective_frames_upbound() or None
+                    )
 
                 processor = self.data_args.image_processor
                 image = processor.preprocess(video, return_tensors="pt")["pixel_values"]
@@ -1629,7 +1694,8 @@ class LazySupervisedDataset(Dataset):
                 else: raise ValueError(f"Unsupported intrinsics format in {intrinsics_file_path}")
 
                 # 3. Sample Frames
-                num_frames_to_sample = self.data_args.frames_upbound if self.data_args.frames_upbound > 0 else 8
+                eff = self._get_effective_frames_upbound()
+                num_frames_to_sample = eff if eff > 0 else 8
                 num_frames_to_sample = min(num_frames_to_sample, total_frames) # Cannot sample more than available
                 if total_frames <= num_frames_to_sample: # Use all frames if less than desired sample count
                     sampled_indices = np.arange(total_frames)
@@ -1913,9 +1979,17 @@ class DataCollatorForSupervisedDataset(object):
 
 def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer, data_args) -> Dict:
     """Make dataset and collator for supervised fine-tuning."""
-    train_dataset = LazySupervisedDataset(tokenizer=tokenizer, data_path=data_args.data_path, data_args=data_args)
+    effective_frames_value = None
+    if getattr(data_args, "first_step_frames", None) and data_args.first_step_frames > 0 and getattr(data_args, "frames_upbound", None) and data_args.frames_upbound > 0:
+        effective_frames_value = multiprocessing.Value("i", data_args.first_step_frames)
+    train_dataset = LazySupervisedDataset(
+        tokenizer=tokenizer, data_path=data_args.data_path, data_args=data_args, effective_frames_value=effective_frames_value
+    )
     data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
-    return dict(train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator)
+    result = dict(train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator)
+    if effective_frames_value is not None:
+        result["effective_frames_value"] = effective_frames_value
+    return result
 
 
 def get_model(model_args, training_args, bnb_model_from_pretrained_args):
@@ -2091,6 +2165,24 @@ def train(attn_implementation=None):
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
+    # Set NCCL process group timeout early (before DeepSpeed/Accelerator) so multi-GPU runs don't hit default 10 min
+    import datetime
+    _rank = os.environ.get("RANK")
+    _already = torch.distributed.is_initialized()
+    print("[NCCL timeout] RANK=%s is_initialized=%s" % (_rank, _already), flush=True)
+    if not _already and _rank is not None:
+        _hours = int(os.environ.get("VLM_NCCL_TIMEOUT_HOURS", "24"))
+        _timeout = datetime.timedelta(hours=_hours)
+        torch.distributed.init_process_group(backend="nccl", timeout=_timeout)
+        rank0_print(f"NCCL process group initialized with timeout={_timeout} (early init for multi-GPU).")
+    if _rank is not None and torch.distributed.is_initialized():
+        _hours = int(os.environ.get("VLM_NCCL_TIMEOUT_HOURS", "24"))
+        _timeout = datetime.timedelta(hours=_hours)
+        torch.distributed.distributed_c10d._set_pg_timeout(_timeout)
+        rank0_print(f"NCCL timeout set to {_timeout} on default process group (watchdog may ignore init timeout).")
+    elif not _already:
+        rank0_print("NCCL early init skipped (RANK unset; single-process run?).")
+
     # 设置随机种子以保证可复现性
     seed = training_args.seed
     random.seed(seed)
@@ -2137,13 +2229,19 @@ def train(attn_implementation=None):
     model.config.use_cache = False
 
     # Load and merge task LoRA (e.g. VLM-3R) so we always train on top of it
-    if getattr(training_args, "lora_weight_path", None) and (s := (training_args.lora_weight_path or "").strip()):
+    memory_mode = getattr(model_args, "memory_mode", "working_only")
+    task_lora_path = (getattr(training_args, "lora_weight_path", None) or "").strip()
+    if task_lora_path:
         from peft import PeftModel
-        rank0_print(f"Loading task LoRA from {s}...")
-        model = PeftModel.from_pretrained(model, s, is_trainable=False)
+        rank0_print(f"Loading task LoRA from {task_lora_path}...")
+        model = PeftModel.from_pretrained(model, task_lora_path, is_trainable=False)
         rank0_print("Merging task LoRA into base model...")
         model = model.merge_and_unload()
-        rank0_print("Task LoRA merged; training will run on top of this model.")
+        rank0_print(f"Task LoRA merged; training will use base + {task_lora_path} (not base-only).")
+    else:
+        if memory_mode in ("working_only", "both"):
+            rank0_print("WARNING: No lora_weight_path set. Training will use the BASE MODEL ONLY (no VLM-3R task LoRA). "
+                        "Set --lora_weight_path e.g. Journey9ni/vlm-3r-llava-qwen2-lora to train on top of VLM-3R.")
 
     if model_args.rope_scaling_factor is not None and model_args.rope_scaling_type is not None:
         model.config.rope_scaling = {
@@ -2507,9 +2605,12 @@ def train(attn_implementation=None):
                         module = module.to(torch.bfloat16)
 
     data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
-    trainer = LLaVATrainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
+    effective_frames_value = data_module.pop("effective_frames_value", None)
+    callbacks = [StepProgressCallback()]
+    if effective_frames_value is not None:
+        callbacks.append(FirstStepFramesCallback(effective_frames_value, data_args))
+    trainer = LLaVATrainer(model=model, tokenizer=tokenizer, args=training_args, callbacks=callbacks, **data_module)
 
-    # Only resume when explicitly requested (e.g. --resume_from_checkpoint True or a path)
     trainer.train()
     trainer.save_state()
 

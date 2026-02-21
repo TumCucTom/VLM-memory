@@ -3,12 +3,12 @@
 #SBATCH --output=logs/train/working_memory_only_%j.out
 #SBATCH --error=logs/train/working_memory_only_%j.err
 #SBATCH --time=24:00:00
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
+#SBATCH --nodes=2
+#SBATCH --ntasks=2
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=400G
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:4
 #SBATCH --partition=workq
 
 # Load CUDA (need toolkit with headers for DeepSpeed FusedAdam JIT build)
@@ -52,6 +52,8 @@ mkdir -p logs
 export PYTHONWARNINGS=ignore
 export TOKENIZERS_PARALLELISM=false
 export NUM_GPUS_PER_NODE=${SLURM_GPUS_ON_NODE:-4}
+export NCCL_TIMEOUT=86400
+export TORCH_NCCL_BLOCKING_WAIT=1
 
 # Use filtered vsibench (scannet + scannetpp + route_plan); only samples with existing videos
 export DATA_YAML="scripts/VLM_3R/vsibench_data_valid.yaml"

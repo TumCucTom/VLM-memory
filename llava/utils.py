@@ -22,7 +22,8 @@ try:
 except ImportError:
     print("Please install pyav to use video processing functions.")
 
-def process_video_with_decord(video_file, data_args):
+def process_video_with_decord(video_file, data_args, num_frames_override=None):
+    """num_frames_override: if set, use instead of data_args.frames_upbound (e.g. for first-step 1 frame)."""
     vr = VideoReader(video_file, ctx=cpu(0), num_threads=1)
     total_frame_num = len(vr)
     video_time = total_frame_num / vr.get_avg_fps()
@@ -30,10 +31,10 @@ def process_video_with_decord(video_file, data_args):
     frame_idx = [i for i in range(0, total_frame_num, avg_fps)]
     frame_time = [i/avg_fps for i in frame_idx]
 
-    
-    if data_args.frames_upbound > 0:
-        if len(frame_idx) > data_args.frames_upbound or data_args.force_sample:
-            uniform_sampled_frames = np.linspace(0, total_frame_num - 1, data_args.frames_upbound, dtype=int)
+    ncap = num_frames_override if num_frames_override is not None else data_args.frames_upbound
+    if ncap > 0:
+        if len(frame_idx) > ncap or data_args.force_sample:
+            uniform_sampled_frames = np.linspace(0, total_frame_num - 1, ncap, dtype=int)
             frame_idx = uniform_sampled_frames.tolist()
             frame_time = [i/vr.get_avg_fps() for i in frame_idx]
     
@@ -45,7 +46,8 @@ def process_video_with_decord(video_file, data_args):
     vr.seek(0)
     return video, video_time, frame_time, num_frames_to_sample
 
-def process_video_with_pyav(video_file, data_args):
+def process_video_with_pyav(video_file, data_args, num_frames_override=None):
+    """num_frames_override: if set, use instead of data_args.frames_upbound (e.g. for first-step 1 frame)."""
     container = av.open(video_file)
     # !!! This is the only difference. Using auto threading
     container.streams.video[0].thread_type = "AUTO"
@@ -60,9 +62,10 @@ def process_video_with_pyav(video_file, data_args):
     avg_fps = round(total_frame_num / video_time / data_args.video_fps)
     frame_idx = [i for i in range(0, total_frame_num, avg_fps)]
 
-    if data_args.frames_upbound > 0:
-        if len(frame_idx) > data_args.frames_upbound:
-            uniform_sampled_frames = np.linspace(0, total_frame_num - 1, data_args.frames_upbound, dtype=int)
+    ncap = num_frames_override if num_frames_override is not None else data_args.frames_upbound
+    if ncap > 0:
+        if len(frame_idx) > ncap:
+            uniform_sampled_frames = np.linspace(0, total_frame_num - 1, ncap, dtype=int)
             frame_idx = uniform_sampled_frames.tolist()
 
 

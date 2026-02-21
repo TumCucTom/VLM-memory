@@ -4,14 +4,21 @@
 
 set -e
 export OMP_NUM_THREADS=8
-export NCCL_IB_DISABLE=0
+# For multinode timeout issues, try NCCL_IB_DISABLE=1 (TCP fallback)
+export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-0}"
 export NCCL_IB_GID_INDEX=3
 unset NCCL_SOCKET_IFNAME 2>/dev/null || true
 export NCCL_DEBUG=INFO
+# Multi-GPU: process group timeout (hours); train.py inits with this before DeepSpeed (default 24)
+export VLM_NCCL_TIMEOUT_HOURS="${VLM_NCCL_TIMEOUT_HOURS:-24}"
+# torch_compile: disabled (PyTorch NCCL watchdog has hardcoded 10min; first step can exceed that with 4 GPUs)
 
-# Model: base VLM + optional task LoRA (e.g. VLM-3R) to load/merge before training
+# Model: base VLM + task LoRA (VLM-3R) merged before training — training uses base + LoRA, not base-only
 MODEL_PATH="lmms-lab/LLaVA-NeXT-Video-7B-Qwen2"
-TASK_LORA_PATH="${TASK_LORA_PATH:-Journey9ni/vlm-3r-llava-qwen2-lora}"
+TASK_LORA_PATH="${TASK_LORA_PATH:-Journey9ni/vlm-3r-llava-qwen2-lora}"  # required for VLM-3R; do not unset
+# Frames: use 1 frame for first N steps (avoids NCCL timeout), then FRAMES_UPBOUND. first_step_frames=0 disables; first_n_steps_frames=3 uses 1 frame for steps 0,1,2.
+FIRST_STEP_FRAMES="${FIRST_STEP_FRAMES:-1}"
+FIRST_N_STEPS_FRAMES="${FIRST_N_STEPS_FRAMES:-5}"
 VISION_MODEL_VERSION="google/siglip-so400m-patch14-384"
 SPATIAL_TOWER="cut3r"
 SPATIAL_TOWER_SELECT_FEATURE="patch_tokens"
@@ -25,7 +32,7 @@ MEMORY_L_E=32
 MEMORY_NUM_HEADS=8
 MEMORY_DROPOUT=0.1
 
-# Training (reasonable hyperparameters)
+# Training (reasonable hyperparameters). Smaller effective batch (fewer accumulation steps) to reduce per-step time and avoid NCCL timeout on multinode.
 NUM_TRAIN_EPOCHS=3
 LEARNING_RATE=1e-4
 BATCH_SIZE=1
@@ -55,7 +62,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 cd "$PROJECT_DIR"
 
-# Multinode: set NNODES and NODE_RANK (e.g. by Slurm srun); MASTER_ADDR and MASTER_PORT set by job script
+# Multinode: set NNODES and NODE_RANK (e.g. by Slurm srun; train_working_memory_only.slurm uses 2 nodes = 8 GPUs)
 NNODES=${NNODES:-1}
 NODE_RANK=${NODE_RANK:-0}
 # Disable CPU affinity to avoid requiring pynvml on compute nodes (can set to 1 if pynvml is available later)
@@ -122,10 +129,12 @@ ACCELERATE_CPU_AFFINITY=0 torchrun \
     --dataloader_num_workers 2 \
     --lazy_preprocess True \
     --report_to wandb \
-    --torch_compile True \
+    --torch_compile False \
     --torch_compile_backend "inductor" \
     --dataloader_drop_last True \
-    --frames_upbound 32 \
+    --frames_upbound ${FRAMES_UPBOUND:-32} \
+    --first_step_frames ${FIRST_STEP_FRAMES:-1} \
+    --first_n_steps_frames ${FIRST_N_STEPS_FRAMES:-5} \
     --mm_newline_position grid
 
 echo "=========================================="

@@ -15,7 +15,7 @@ from transformers.trainer import is_sagemaker_mp_enabled, get_parameter_names, h
 from transformers.trainer_utils import seed_worker
 from transformers.trainer_pt_utils import get_length_grouped_indices as get_length_grouped_indices_hf
 from transformers.trainer_pt_utils import AcceleratorConfig
-from typing import List, Optional
+from typing import List, Optional, Dict, Union, Any
 from datetime import timedelta
 
 if is_accelerate_available():
@@ -25,6 +25,7 @@ if is_datasets_available():
     import datasets
 
 from llava.utils import rank0_print
+
 
 # Borrowed from peft.utils.get_peft_model_state_dict
 def get_peft_state_maybe_zero_3(named_params, bias):
@@ -275,8 +276,9 @@ class LLaVATrainer(Trainer):
         grad_acc_kwargs["sync_with_dataloader"] = False
         gradient_accumulation_plugin = GradientAccumulationPlugin(**grad_acc_kwargs)
 
-        accelerator_kwargs = InitProcessGroupKwargs(timeout=timedelta(weeks=52))
-        rank0_print("Setting NCCL timeout to INF to avoid running errors.")
+        # Long timeout for NCCL collectives (multi-GPU); default is 10 min and can be hit on heavy steps
+        accelerator_kwargs = InitProcessGroupKwargs(timeout=timedelta(hours=24))
+        rank0_print("Setting NCCL timeout to 24h to avoid multi-GPU collective timeouts.")
 
         # create accelerator object
         self.accelerator = Accelerator(
