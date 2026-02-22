@@ -104,6 +104,19 @@ class Vlm3r(lmms):
             self.model_name = model_name
         else:
             self.model_name = get_model_name_from_path(pretrained)
+        # Local full checkpoint (work_dirs/.../checkpoint-*): use repo llava (working memory) and ensure builder picks LLaVA-Qwen
+        _load_pretrained_model = load_pretrained_model
+        if "work_dirs" in str(pretrained) and "checkpoint" in str(pretrained):
+            import os as _os
+            import importlib
+            _repo = _os.path.abspath(_os.path.join(_os.path.dirname(__file__), "../../.."))
+            if _repo not in sys.path:
+                sys.path.insert(0, _repo)
+            if self.model_name and "llava" not in self.model_name.lower():
+                self.model_name = "llava_qwen"
+            import llava.model.builder as _builder_module
+            importlib.reload(_builder_module)
+            _load_pretrained_model = _builder_module.load_pretrained_model
         self.video_decode_backend = video_decode_backend
         # self._config = AutoConfig.from_pretrained(self.pretrained)
         self.overwrite = overwrite
@@ -170,9 +183,9 @@ class Vlm3r(lmms):
                 else:
                     self._max_length = 2048
             else:
-                self._tokenizer, self._model, self._image_processor, self._max_length = load_pretrained_model(pretrained, model_base, self.model_name, device_map=self.device_map, overwrite_config=overwrite_config)
+                self._tokenizer, self._model, self._image_processor, self._max_length = _load_pretrained_model(pretrained, model_base, self.model_name, device_map=self.device_map, overwrite_config=overwrite_config)
         else:
-            self._tokenizer, self._model, self._image_processor, self._max_length = load_pretrained_model(
+            self._tokenizer, self._model, self._image_processor, self._max_length = _load_pretrained_model(
                 pretrained,
                 None,
                 self.model_name,
