@@ -119,25 +119,42 @@ def export_scene_video(sens_file_path, output_video_path, width, height, fps, fr
                 skipped_frames += 1
                 continue
 
-            # Ensure image is NumPy array and convert RGB to BGR for OpenCV
-            if not isinstance(color_image_rgb, np.ndarray):
-                 try:
-                     color_image_rgb = np.array(color_image_rgb)
-                 except Exception as e_conv:
-                     print(f"Warning: Could not convert decompressed image to NumPy array for frame {i}: {e_conv}. Skipping frame.")
-                     skipped_frames += 1
-                     continue
+            # PIL Image from imageio/imread: convert to numpy first
+            if hasattr(color_image_rgb, 'mode') and hasattr(color_image_rgb, 'size'):
+                try:
+                    from PIL import Image
+                    color_image_rgb = np.array(color_image_rgb, dtype=np.uint8)
+                except Exception:
+                    pass
+            # Ensure image is NumPy array (OpenCV needs contiguous uint8)
+            try:
+                if not isinstance(color_image_rgb, np.ndarray):
+                    color_image_rgb = np.array(color_image_rgb, dtype=np.uint8, copy=True)
+                elif color_image_rgb.dtype != np.uint8:
+                    color_image_rgb = np.clip(color_image_rgb, 0, 255).astype(np.uint8)
+                if color_image_rgb.ndim < 2:
+                    raise ValueError(f"ndim {color_image_rgb.ndim}")
+                color_image_rgb = np.ascontiguousarray(np.array(color_image_rgb, dtype=np.uint8, copy=True))
+            except Exception as e_conv:
+                print(f"Warning: Could not convert to uint8 array for frame {i}: {e_conv}. Skipping frame.")
+                skipped_frames += 1
+                continue
 
-            if len(color_image_rgb.shape) == 3 and color_image_rgb.shape[2] == 3:
-                 color_image_bgr = cv2.cvtColor(color_image_rgb, cv2.COLOR_RGB2BGR)
-            elif len(color_image_rgb.shape) == 2: # Grayscale
-                 color_image_bgr = cv2.cvtColor(color_image_rgb, cv2.COLOR_GRAY2BGR)
-            elif len(color_image_rgb.shape) == 3 and color_image_rgb.shape[2] == 4:
-                 color_image_bgr = cv2.cvtColor(color_image_rgb, cv2.COLOR_RGBA2BGR)
-            else:
-                 print(f"Warning: Unexpected image format/shape ({color_image_rgb.shape}) for frame {i}. Skipping frame.")
-                 skipped_frames += 1
-                 continue
+            try:
+                if len(color_image_rgb.shape) == 3 and color_image_rgb.shape[2] == 3:
+                    color_image_bgr = cv2.cvtColor(color_image_rgb, cv2.COLOR_RGB2BGR)
+                elif len(color_image_rgb.shape) == 2:
+                    color_image_bgr = cv2.cvtColor(color_image_rgb, cv2.COLOR_GRAY2BGR)
+                elif len(color_image_rgb.shape) == 3 and color_image_rgb.shape[2] == 4:
+                    color_image_bgr = cv2.cvtColor(color_image_rgb, cv2.COLOR_RGBA2BGR)
+                else:
+                    print(f"Warning: Unexpected image format/shape ({color_image_rgb.shape}) for frame {i}. Skipping frame.")
+                    skipped_frames += 1
+                    continue
+            except Exception as e_cv:
+                print(f"Warning: cvtColor failed for frame {i} (type={type(color_image_rgb)}, shape={getattr(color_image_rgb, 'shape', None)}): {e_cv}. Skipping frame.")
+                skipped_frames += 1
+                continue
 
             # Resize image if necessary
             current_height, current_width = color_image_bgr.shape[:2]
@@ -161,6 +178,8 @@ def export_scene_video(sens_file_path, output_video_path, width, height, fps, fr
         if writer.isOpened():
             writer.release()
 
+    if processed_frames == 0:
+        success = False
     if success:
         print(f'Finished exporting video for scene.')
         print(f'Processed {processed_frames} frames.')
@@ -170,7 +189,7 @@ def export_scene_video(sens_file_path, output_video_path, width, height, fps, fr
     else:
         print(f"Failed to fully export video for scene {os.path.basename(os.path.dirname(sens_file_path))}.")
         # Clean up partially created video file if process failed significantly
-        if os.path.exists(output_video_path) and processed_frames == 0: # Or some other condition
+        if os.path.exists(output_video_path) and processed_frames == 0:
              print(f"Deleting potentially incomplete file: {output_video_path}")
              try:
                  os.remove(output_video_path)

@@ -2,7 +2,7 @@
 #SBATCH --job-name=arkit_preprocess
 #SBATCH --output=logs/preprocess_arkitscenes_%j.out
 #SBATCH --error=logs/preprocess_arkitscenes_%j.err
-#SBATCH --time=2-00:00:00
+#SBATCH --time=1-00:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
