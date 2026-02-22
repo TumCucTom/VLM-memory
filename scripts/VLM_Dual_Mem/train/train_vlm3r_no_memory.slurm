@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=wm_only_Lw8
-#SBATCH --output=logs/train/working_memory_only_%j.out
-#SBATCH --error=logs/train/working_memory_only_%j.err
+#SBATCH --job-name=vlm3r_no_mem
+#SBATCH --output=logs/train/vlm3r_no_memory_%j.out
+#SBATCH --error=logs/train/vlm3r_no_memory_%j.err
 #SBATCH --time=24:00:00
 #SBATCH --nodes=8
 #SBATCH --ntasks=8
@@ -64,9 +64,9 @@ if [ "${SLURM_NNODES:-1}" -gt 1 ]; then
   export MASTER_PORT=${MASTER_PORT:-29500}
   export NNODES=$SLURM_NNODES
   srun --ntasks=$SLURM_NNODES --ntasks-per-node=1 --kill-on-bad-exit=1 \
-    bash -c 'export NODE_RANK=$SLURM_PROCID; bash scripts/VLM_Dual_Mem/train/train_working_memory_only.sh'
+    bash -c 'export NODE_RANK=$SLURM_PROCID; bash scripts/VLM_Dual_Mem/train/train_vlm3r_no_memory.sh'
 else
-  bash scripts/VLM_Dual_Mem/train/train_working_memory_only.sh
+  bash scripts/VLM_Dual_Mem/train/train_vlm3r_no_memory.sh
 fi
 
 echo "End Time: $(date)"

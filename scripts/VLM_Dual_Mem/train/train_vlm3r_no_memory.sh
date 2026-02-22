@@ -1,6 +1,6 @@
 #!/bin/bash
-# Train with everything frozen except working memory (size 8).
-# Dual memory and episodic memory components are disabled (memory_mode=working_only).
+# Train VLM-3R as-is: base + task LoRA merged, no memory components (no dual_memory training).
+# Same as train_working_memory_only.sh except memory is not used/trained.
 
 set -e
 export OMP_NUM_THREADS=8
@@ -21,7 +21,7 @@ SPATIAL_TOWER_SELECT_FEATURE="patch_tokens"
 SPATIAL_FEATURE_DIM=768
 FUSION_BLOCK="cross_attention"
 
-# Memory: working memory only, size 8 (episodic/dual fusion disabled)
+# No memory: do not train memory components (mm_tunable_parts empty)
 MEMORY_MODE="working_only"
 MEMORY_L_W=8
 MEMORY_L_E=32
@@ -42,14 +42,13 @@ DATA_YAML="${DATA_YAML:-scripts/VLM_3R/vsibench_data.yaml}"
 IMAGE_FOLDER="data/vlm_3r_data"
 VIDEO_FOLDER="data/vlm_3r_data"
 
-RUN_NAME="vlm2-working-memory-only-Lw8"
+RUN_NAME="vlm2-vlm3r-no-memory"
 OUTPUT_DIR="work_dirs/${RUN_NAME}"
 
 echo "=========================================="
-echo "Working memory only (L_w=${MEMORY_L_W}), dual/episodic disabled"
+echo "VLM-3R no memory (train as-is, no dual_memory)"
 echo "=========================================="
 echo "Model: ${MODEL_PATH}"
-echo "Memory mode: ${MEMORY_MODE}"
 echo "Output: ${OUTPUT_DIR}"
 echo "=========================================="
 
@@ -58,7 +57,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 cd "$PROJECT_DIR"
 
-# Multinode: set NNODES and NODE_RANK (e.g. by Slurm srun; train_working_memory_only.slurm uses 2 nodes = 8 GPUs)
+# Multinode: set NNODES and NODE_RANK (e.g. by Slurm srun; train_vlm3r_no_memory.slurm uses 8 nodes = 32 GPUs)
 NNODES=${NNODES:-1}
 NODE_RANK=${NODE_RANK:-0}
 # Disable CPU affinity to avoid requiring pynvml on compute nodes (can set to 1 if pynvml is available later)
@@ -92,7 +91,7 @@ ACCELERATE_CPU_AFFINITY=0 torchrun \
     --memory_L_e ${MEMORY_L_E} \
     --memory_num_heads ${MEMORY_NUM_HEADS} \
     --memory_dropout ${MEMORY_DROPOUT} \
-    --mm_tunable_parts "dual_memory" \
+    --mm_tunable_parts "" \
     --vision_tower ${VISION_MODEL_VERSION} \
     --mm_projector_type mlp2x_gelu \
     --mm_vision_select_layer -2 \
@@ -129,7 +128,6 @@ ACCELERATE_CPU_AFFINITY=0 torchrun \
     --torch_compile_backend "inductor" \
     --dataloader_drop_last True \
     --frames_upbound ${FRAMES_UPBOUND:-32} \
-
     --mm_newline_position grid
 
 echo "=========================================="
