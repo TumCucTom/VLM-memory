@@ -854,18 +854,25 @@ class LlavaMetaForCausalLM(ABC):
             self.get_model().get_episodic_memory() is not None
         ):
             image_features = self.get_model()._apply_dual_memory(image_features)
-            if self.training and not image_features.requires_grad and self.get_model().get_working_memory() is not None:
+            # Training: ensure grad path through working_attention (fixes "does not require grad" backward error).
+            if self.training and self.get_model().get_working_memory() is not None:
+                wa = self.get_model().working_attention
                 if image_features.dim() == 3:
                     out_list = []
                     for i in range(image_features.shape[0]):
-                        q = image_features[i : i + 1].unsqueeze(0)
-                        o, _ = self.get_model().working_attention(q, q, q)
-                        out_list.append(o.squeeze(0).squeeze(0))
-                    image_features = torch.stack(out_list, dim=0)
+                        q = image_features[i : i + 1]  # [1, N, D]
+                        o, _ = wa(q, q, q)
+                        out_list.append(o.squeeze(0))
+                    safety_out = torch.stack(out_list, dim=0)
                 else:
-                    q = image_features.unsqueeze(0) if image_features.dim() == 2 else image_features.unsqueeze(0)
-                    o, _ = self.get_model().working_attention(q, q, q)
-                    image_features = o.squeeze(0)
+                    q = image_features.unsqueeze(0) if image_features.dim() == 2 else image_features
+                    if q.dim() == 2:
+                        q = q.unsqueeze(0)
+                    o, _ = wa(q, q, q)
+                    safety_out = o.squeeze(0)
+                # Force grad path: (safety_out - safety_out.detach()) is 0 in forward but passes grad to safety_out in backward.
+                image_features = image_features + (safety_out - safety_out.detach())
+            return image_features
         return image_features
     
     def encode_multimodals(self, videos_or_images, video_idx_in_batch, split_sizes=None):

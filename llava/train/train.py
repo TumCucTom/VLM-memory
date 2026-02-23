@@ -48,6 +48,12 @@ import tokenizers
 import deepspeed
 import concurrent.futures
 
+# DEBUG: Print where llava is imported from
+import llava
+print(f"[DEBUG] llava module location: {llava.__file__}", flush=True)
+import llava.model.llava_arch
+print(f"[DEBUG] llava_arch module location: {llava.model.llava_arch.__file__}", flush=True)
+
 from transformers import AutoConfig
 from transformers.trainer_callback import TrainerCallback
 from torch.utils.data import Dataset
