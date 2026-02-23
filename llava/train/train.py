@@ -2232,12 +2232,32 @@ def train(attn_implementation=None):
     memory_mode = getattr(model_args, "memory_mode", "working_only")
     task_lora_path = (getattr(training_args, "lora_weight_path", None) or "").strip()
     if task_lora_path:
+        # Load non_lora_trainables (mm_projector, vision_resampler, fusion_block) from task LoRA so we match valid eval
+        import os as _os
+        _nl_path = _os.path.join(task_lora_path, "non_lora_trainables.bin")
+        if _os.path.isfile(_nl_path):
+            rank0_print("Loading non-LoRA adapter from task LoRA...")
+            _nl = torch.load(_nl_path, map_location="cpu")
+        else:
+            try:
+                from huggingface_hub import hf_hub_download
+                _nl = torch.load(hf_hub_download(repo_id=task_lora_path, filename="non_lora_trainables.bin"), map_location="cpu")
+                rank0_print("Loaded non-LoRA adapter from HuggingFace task LoRA")
+            except Exception:
+                _nl = None
+        if _nl is not None:
+            _nl = {(k[11:] if k.startswith("base_model.") else k): v for k, v in _nl.items()}
+            if any(k.startswith("model.model.") for k in _nl):
+                _nl = {(k[6:] if k.startswith("model.") else k): v for k, v in _nl.items()}
+            model.load_state_dict(_nl, strict=False)
+        else:
+            rank0_print("No non_lora_trainables in task LoRA; training uses base projectors.")
         from peft import PeftModel
         rank0_print(f"Loading task LoRA from {task_lora_path}...")
         model = PeftModel.from_pretrained(model, task_lora_path, is_trainable=False)
         rank0_print("Merging task LoRA into base model...")
         model = model.merge_and_unload()
-        rank0_print(f"Task LoRA merged; training will use base + {task_lora_path} (not base-only).")
+        rank0_print("Task LoRA merged; training uses base + non_lora + LoRA (same as valid eval).")
     else:
         if memory_mode in ("working_only", "both"):
             rank0_print("WARNING: No lora_weight_path set. Training will use the BASE MODEL ONLY (no VLM-3R task LoRA). "

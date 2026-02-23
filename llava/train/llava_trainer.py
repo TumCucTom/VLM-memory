@@ -270,6 +270,13 @@ class LengthGroupedSampler(Sampler):
 
 
 class LLaVATrainer(Trainer):
+    def training_step(self, model, inputs):
+        # Clear dual memory at the start of each step so each batch (video) gets fresh memory (align with eval).
+        from transformers.modeling_utils import unwrap_model
+        inner = unwrap_model(model)
+        if getattr(inner, "clear_all_memory", None) is not None:
+            inner.clear_all_memory()
+        return super().training_step(model, inputs)
 
     def create_accelerator_and_postprocess(self):
         grad_acc_kwargs = {"num_steps": self.args.gradient_accumulation_steps}
