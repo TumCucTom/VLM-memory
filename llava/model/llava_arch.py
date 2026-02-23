@@ -236,9 +236,14 @@ class LlavaMetaModel:
                             rank0_print(f"[WARNING] Frame {frame_idx}: Working attention output identical to input! "
                                       f"diff_norm={diff_norm:.6f}")
                     else:
+                        # Buffer empty (e.g. first frame or single image): still pass through working_attention
+                        # so the loss has a grad path to trainable params (fixes "does not require grad" backward error).
                         if frame_idx == 0:
-                            rank0_print(f"[Dual Memory] Frame {frame_idx}: Working memory empty (first frame)")
-                        M_t_w_frame = H_t_frame  # [N, D]
+                            rank0_print(f"[Dual Memory] Frame {frame_idx}: Working memory empty (first frame), passing through working_attention for grad path")
+                        M_t_w_frame, _ = self.working_attention(
+                            query=query, key=query, value=query
+                        )
+                        M_t_w_frame = M_t_w_frame.squeeze(0)  # [N, D]
                 else:
                     M_t_w_frame = H_t_frame
                 
@@ -279,9 +284,13 @@ class LlavaMetaModel:
                             rank0_print(f"[WARNING] Frame {frame_idx}: Episodic attention output identical to input! "
                                       f"diff_norm={diff_norm:.6f}")
                     else:
+                        # Buffer empty: pass through episodic_attention so loss has grad path to trainable params.
                         if frame_idx == 0:
-                            rank0_print(f"[Dual Memory] Frame {frame_idx}: Episodic memory empty (first frame)")
-                        M_t_e_frame = H_t_frame  # [N, D]
+                            rank0_print(f"[Dual Memory] Frame {frame_idx}: Episodic memory empty (first frame), passing through episodic_attention for grad path")
+                        M_t_e_frame, _ = self.episodic_attention(
+                            query=query, key=query, value=query
+                        )
+                        M_t_e_frame = M_t_e_frame.squeeze(0)  # [N, D]
                 else:
                     M_t_e_frame = H_t_frame
                 
