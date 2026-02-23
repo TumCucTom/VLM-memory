@@ -453,7 +453,9 @@ class LlavaMetaModel:
                     M_t_w, _ = self.working_attention(query=query, key=W_t_tensor, value=W_t_tensor)
                     M_t_w = M_t_w.squeeze(0) if M_t_w.dim() > H_t.dim() else M_t_w
                 else:
-                    M_t_w = H_t
+                    # Buffer empty: pass through working_attention so loss has grad path (fixes backward "does not require grad").
+                    M_t_w, _ = self.working_attention(query=query, key=query, value=query)
+                    M_t_w = M_t_w.squeeze(0) if M_t_w.dim() > H_t.dim() else M_t_w
             else:
                 M_t_w = H_t
             
@@ -468,7 +470,9 @@ class LlavaMetaModel:
                     M_t_e, _ = self.episodic_attention(query=query, key=E_t_tensor, value=E_t_tensor)
                     M_t_e = M_t_e.squeeze(0) if M_t_e.dim() > H_t.dim() else M_t_e
                 else:
-                    M_t_e = H_t
+                    # Buffer empty: pass through episodic_attention so loss has grad path.
+                    M_t_e, _ = self.episodic_attention(query=query, key=query, value=query)
+                    M_t_e = M_t_e.squeeze(0) if M_t_e.dim() > H_t.dim() else M_t_e
             else:
                 M_t_e = H_t
             
