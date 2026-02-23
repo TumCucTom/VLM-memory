@@ -209,7 +209,8 @@ class Vlm3r(lmms):
         # Overlay adapter + memory weights from checkpoint (good base from base+LoRA, then overlay trained adapter/memory)
         if checkpoint_adapter and model_base and os.path.isdir(checkpoint_adapter):
             from safetensors.torch import load_file
-            # Checkpoint state_dict keys use one "model." prefix (LlavaQwenForCausalLM.model = LlavaQwenModel).
+            # State_dict keys use one "model." prefix for LLaVA parts (LlavaQwenForCausalLM.model = LlavaQwenModel).
+            # "model.model." is the inner Qwen2Model; memory/projectors live under "model.*".
             _adapter_prefixes = (
                 "model.fusion_block.",
                 "model.mm_projector.",
@@ -221,6 +222,7 @@ class Vlm3r(lmms):
                 "model.working_attention.",
                 "model.episodic_attention.",
             )
+            # 1) Overlay from safetensors (LoRA shards; may also contain extra state_dict if saved that way)
             index_path = os.path.join(checkpoint_adapter, "model.safetensors.index.json")
             if os.path.isfile(index_path):
                 import json
@@ -237,7 +239,16 @@ class Vlm3r(lmms):
                     adapter_dict = {k: state[k] for k in adapter_keys if k in state}
                     if adapter_dict:
                         self._model.load_state_dict(adapter_dict, strict=False)
-                        eval_logger.info(f"Overlaid {len(adapter_dict)} adapter weights from {checkpoint_adapter}")
+                        eval_logger.info(f"Overlaid {len(adapter_dict)} adapter weights from safetensors in {checkpoint_adapter}")
+            # 2) Overlay non-LoRA trainables (working_memory, episodic_memory, projectors, etc.) — same key handling as builder
+            non_lora_path = os.path.join(checkpoint_adapter, "non_lora_trainables.bin")
+            if os.path.isfile(non_lora_path):
+                non_lora = torch.load(non_lora_path, map_location="cpu", weights_only=True)
+                non_lora = {(k[11:] if k.startswith("base_model.") else k): v for k, v in non_lora.items()}
+                if any(k.startswith("model.model.") for k in non_lora):
+                    non_lora = {(k[6:] if k.startswith("model.") else k): v for k, v in non_lora.items()}
+                self._model.load_state_dict(non_lora, strict=False)
+                eval_logger.info(f"Overlaid {len(non_lora)} non-LoRA trainables (e.g. working/episodic memory) from {non_lora_path}")
 
         self._config = self._model.config
         self.model.eval()
