@@ -46,24 +46,25 @@ class WorkingMemory(nn.Module):
         """
         Update Working Memory (Algorithm 1 Lines 8-14)
         
+        Store full H_t (paper: W_{t+1} <- W_t cup {H_t}). No mean-pooling; gradients
+        flow into stored content (no detach) so retrieval can be trained end-to-end.
+        
         Args:
-            H_t: Current input features [B, N, D] or [N, D] or [D]
-                where D is feature_dim
+            H_t: Current input features [N, D] or [D] per frame
         
         Returns:
             Updated working memory buffer W_{t+1}
         """
         buffer = self.get_buffer()
         
-        # Ensure H_t is a tensor and handle different input shapes
+        # Ensure H_t is a tensor
         if not isinstance(H_t, torch.Tensor):
             H_t = torch.tensor(H_t)
         
-        # Store a copy to avoid reference issues
-        H_t = H_t.detach().clone()
+        # Store a copy; do not detach so gradients can flow through retrieval (paper-aligned)
+        H_t = H_t.clone()
         
         # Algorithm 1 Line 8: if |W_t| < L_w then
-        was_full = len(buffer) >= self.L_w
         old_first = buffer[0].clone() if len(buffer) > 0 else None
         
         if len(buffer) < self.L_w:
@@ -71,9 +72,7 @@ class WorkingMemory(nn.Module):
             buffer.append(H_t)
         else:
             # Algorithm 1 Lines 10-13: Remove oldest element (FIFO)
-            # Remove first element (oldest)
             removed_elem = buffer.pop(0)
-            # Add new element
             buffer.append(H_t)
             
             # DEBUG: Verify FIFO mechanism - oldest element should be removed

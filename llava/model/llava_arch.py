@@ -207,15 +207,9 @@ class LlavaMetaModel:
                     if len(W_t) > 0:
                         rank0_print(f"[Dual Memory] Frame {frame_idx}: Working memory retrieval from {len(W_t)} elements")
                         
-                        # Prepare key-value from working memory
-                        memory_list = []
-                        for mem_elem in W_t:
-                            mem_elem = mem_elem.to(device)
-                            if mem_elem.dim() > 1:
-                                mem_elem = mem_elem.flatten()
-                            memory_list.append(mem_elem)
-                        
-                        W_t_tensor = torch.stack(memory_list, dim=0).unsqueeze(0)  # [1, L_w, D]
+                        # Key/value from working memory: full sequences per slot [N,D] -> concat -> [1, L_w*N, D]
+                        memory_list = [mem_elem.to(device) for mem_elem in W_t]
+                        W_t_tensor = torch.cat(memory_list, dim=0).unsqueeze(0)  # [1, total_seq, D]
                         
                         # DEBUG: Verify attention retrieval is happening
                         H_t_frame_mean = H_t_frame.mean().item()
@@ -256,15 +250,9 @@ class LlavaMetaModel:
                     if len(E_t) > 0:
                         rank0_print(f"[Dual Memory] Frame {frame_idx}: Episodic memory retrieval from {len(E_t)} elements")
                         
-                        # Prepare key-value from episodic memory
-                        memory_list = []
-                        for mem_elem in E_t:
-                            mem_elem = mem_elem.to(device)
-                            if mem_elem.dim() > 1:
-                                mem_elem = mem_elem.flatten()
-                            memory_list.append(mem_elem)
-                        
-                        E_t_tensor = torch.stack(memory_list, dim=0).unsqueeze(0)  # [1, L_e, D]
+                        # Key/value from episodic memory: full sequences per slot -> concat -> [1, total_seq, D]
+                        memory_list = [mem_elem.to(device) for mem_elem in E_t]
+                        E_t_tensor = torch.cat(memory_list, dim=0).unsqueeze(0)  # [1, total_seq, D]
                         
                         # DEBUG: Verify attention retrieval is happening
                         H_t_frame_mean_before = H_t_frame.mean().item()
@@ -341,13 +329,12 @@ class LlavaMetaModel:
                 
                 M_t_list.append(M_t_frame)
                 
-                # Extract representations for storage: mean pool over sequence
-                H_t_for_storage = H_t_frame.mean(dim=0)  # [D] - for working memory
-                M_t_for_storage = M_t_frame.mean(dim=0)  # [D] - for episodic memory (fused memory or working memory output)
+                # Storage: full H_t and M_t per paper (no mean-pooling)
+                H_t_for_storage = H_t_frame  # [N, D] - for working memory
+                M_t_for_storage = M_t_frame  # [N, D] - for episodic memory
                 
                 # Algorithm 1 Lines 8-14: Update Working Memory (FIFO)
                 # Working memory uses H_t (raw input features)
-                # Only update if working memory is enabled
                 if use_working and working_memory is not None:
                     old_w_size = len(working_memory)
                     old_w_buffer = working_memory.get_buffer().copy() if old_w_size > 0 else []

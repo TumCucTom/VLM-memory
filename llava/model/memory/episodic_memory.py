@@ -131,17 +131,15 @@ class EpisodicMemory(nn.Module):
         if not isinstance(H_t, torch.Tensor):
             H_t = torch.tensor(H_t)
         
-        # Store a copy to avoid reference issues
+        # Store a copy (full sequence per paper: E stores M_t, not mean-pooled)
         H_t = H_t.detach().clone()
         
-        # Extract a single representation: mean pool over sequence if needed
-        if H_t.dim() > 1:
-            # If [B, N, D] or [N, D], mean pool to [D]
-            H_t = H_t.mean(dim=tuple(range(H_t.dim() - 1)))
+        # For salience gate only: use single vector (mean over sequence) so MLP gets [D]
+        gate_input = H_t.mean(dim=tuple(range(H_t.dim() - 1))) if H_t.dim() > 1 else H_t
         
         # Gated attention: Check if information is salient enough to store
         if self.use_gated_attention:
-            salience_score = self._compute_salience(H_t)
+            salience_score = self._compute_salience(gate_input)
             salience_val = salience_score.item() if isinstance(salience_score, torch.Tensor) else salience_score
             
             # DEBUG: Log salience scores (only for first few frames or when filtered)
@@ -150,13 +148,12 @@ class EpisodicMemory(nn.Module):
                     print(f"[Episodic Memory DEBUG] Frame filtered by salience gate: score={salience_val:.4f} < threshold={salience_threshold}")
             
             if salience_val < salience_threshold:
-                # Not salient enough - skip storing in episodic memory
-                # This helps retain only critical information
                 return buffer
         
         # Algorithm 1 Line 15: if |E_t| < L_e then
+        # Store full M_t (H_t here) per paper, not mean-pooled
         if len(buffer) < self.L_e:
-            # Algorithm 1 Line 16: E_{t+1} ← E_t ∪ {H_t}
+            # Algorithm 1 Line 16: E_{t+1} ← E_t ∪ {M_t}
             buffer.append(H_t)
         else:
             # Algorithm 1 Lines 17-23: Find most similar element and replace

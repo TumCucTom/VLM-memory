@@ -209,14 +209,17 @@ class Vlm3r(lmms):
         # Overlay adapter + memory weights from checkpoint (good base from base+LoRA, then overlay trained adapter/memory)
         if checkpoint_adapter and model_base and os.path.isdir(checkpoint_adapter):
             from safetensors.torch import load_file
+            # Checkpoint state_dict keys use one "model." prefix (LlavaQwenForCausalLM.model = LlavaQwenModel).
             _adapter_prefixes = (
                 "model.fusion_block.",
-                "model.model.mm_projector.",
-                "model.model.vision_resampler.",
-                "model.model.working_memory.",
-                "model.model.episodic_memory.",
-                "model.model.memory_fusion_mlp.",
-                "model.model.spatial_tower.",
+                "model.mm_projector.",
+                "model.vision_resampler.",
+                "model.working_memory.",
+                "model.episodic_memory.",
+                "model.memory_fusion_mlp.",
+                "model.spatial_tower.",
+                "model.working_attention.",
+                "model.episodic_attention.",
             )
             index_path = os.path.join(checkpoint_adapter, "model.safetensors.index.json")
             if os.path.isfile(index_path):
