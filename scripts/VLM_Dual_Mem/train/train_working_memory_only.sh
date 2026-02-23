@@ -107,6 +107,7 @@ ACCELERATE_CPU_AFFINITY=0 torchrun \
     --output_dir ${OUTPUT_DIR} \
     $([[ -n "${RESUME_FROM_CHECKPOINT}" ]] && echo --resume_from_checkpoint "${RESUME_FROM_CHECKPOINT}") \
     --num_train_epochs ${NUM_TRAIN_EPOCHS} \
+    --max_steps 1 \
     --per_device_train_batch_size ${BATCH_SIZE} \
     --per_device_eval_batch_size 4 \
     --gradient_accumulation_steps ${GRADIENT_ACCUMULATION_STEPS} \
