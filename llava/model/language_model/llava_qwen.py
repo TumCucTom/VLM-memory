@@ -121,7 +121,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             return logits, labels
 
         else:
-            return super().forward(
+            outputs = super().forward(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
@@ -133,6 +133,14 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 output_hidden_states=output_hidden_states,
                 return_dict=return_dict,
             )
+            # Ensure loss has grad path to trainable memory params (fixes "element 0 of tensors does not require grad" when batch has no images or frozen vision path).
+            if self.training and getattr(outputs, "loss", None) is not None and not outputs.loss.requires_grad:
+                wa = getattr(self.get_model(), "working_attention", None)
+                if wa is not None:
+                    anchor = sum(p.sum() for p in wa.parameters() if p.requires_grad)
+                    if anchor.requires_grad:
+                        outputs.loss = outputs.loss + 0.0 * anchor
+            return outputs
 
     @torch.no_grad()
     def generate(

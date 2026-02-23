@@ -48,12 +48,6 @@ import tokenizers
 import deepspeed
 import concurrent.futures
 
-# DEBUG: Print where llava is imported from
-import llava
-print(f"[DEBUG] llava module location: {llava.__file__}", flush=True)
-import llava.model.llava_arch
-print(f"[DEBUG] llava_arch module location: {llava.model.llava_arch.__file__}", flush=True)
-
 from transformers import AutoConfig
 from transformers.trainer_callback import TrainerCallback
 from torch.utils.data import Dataset
@@ -2654,10 +2648,6 @@ def train(attn_implementation=None):
             torch.save(non_lora_state_dict, os.path.join(training_args.output_dir, "non_lora_trainables.bin"))
     else:
         safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
-        # Also save non-LoRA trainables (working_memory, episodic_memory, etc.) for evaluation
-        non_lora_state_dict = get_peft_state_non_lora_maybe_zero_3(model.named_parameters())
-        if training_args.local_rank == 0 or training_args.local_rank == -1:
-            torch.save(non_lora_state_dict, os.path.join(training_args.output_dir, "non_lora_trainables.bin"))
 
     rank0_print(f"Model saved to {training_args.output_dir}")
 

@@ -131,13 +131,17 @@ class EpisodicMemory(nn.Module):
         if not isinstance(H_t, torch.Tensor):
             H_t = torch.tensor(H_t)
         
-        # Store a copy (full sequence per paper: E stores M_t, not mean-pooled)
-        H_t = H_t.detach().clone()
+        # Store a copy of the full sequence (or single vector) for storage; do not mean-pool before storing.
+        H_t_storage = H_t.detach().clone()
         
-        # For salience gate only: use single vector (mean over sequence) so MLP gets [D]
-        gate_input = H_t.mean(dim=tuple(range(H_t.dim() - 1))) if H_t.dim() > 1 else H_t
+        # For the salience gate we need a single vector [D]: use mean-pool only to compute the gate input.
+        # The gate decides *whether* to store; we then store the full sequence if it passes.
+        if H_t_storage.dim() > 1:
+            gate_input = H_t_storage.mean(dim=tuple(range(H_t_storage.dim() - 1)))  # [D]
+        else:
+            gate_input = H_t_storage  # [D]
         
-        # Gated attention: Check if information is salient enough to store
+        # Gated attention: Check if this (summary) is salient enough to warrant storing in episodic memory
         if self.use_gated_attention:
             salience_score = self._compute_salience(gate_input)
             salience_val = salience_score.item() if isinstance(salience_score, torch.Tensor) else salience_score
@@ -148,42 +152,35 @@ class EpisodicMemory(nn.Module):
                     print(f"[Episodic Memory DEBUG] Frame filtered by salience gate: score={salience_val:.4f} < threshold={salience_threshold}")
             
             if salience_val < salience_threshold:
+                # Not salient enough - skip storing in episodic memory
                 return buffer
         
         # Algorithm 1 Line 15: if |E_t| < L_e then
-        # Store full M_t (H_t here) per paper, not mean-pooled
         if len(buffer) < self.L_e:
-            # Algorithm 1 Line 16: E_{t+1} ← E_t ∪ {M_t}
-            buffer.append(H_t)
+            # Algorithm 1 Line 16: E_{t+1} ← E_t ∪ {M_t} — store full sequence per slot
+            buffer.append(H_t_storage)
         else:
             # Algorithm 1 Lines 17-23: Find most similar element and replace
-            # This similarity-based replacement helps maintain diversity in episodic memory
-            # by replacing redundant (similar) information with new information
-            
-            # Compute similarities with all existing memory elements
+            # Similarity is computed (flattened) so we can compare full sequences or [D] slots.
             similarities = []
             for mem_elem in buffer:
-                sim = self._compute_similarity(H_t, mem_elem)
+                sim = self._compute_similarity(H_t_storage, mem_elem)
                 similarities.append(sim)
             
             # Algorithm 1 Line 18: j* ← argmax_{j} similarity(H_t, E_t[j])
-            # Find index of most similar element (most redundant)
             max_sim_idx = max(range(len(similarities)), key=lambda i: similarities[i])
             max_sim_val = similarities[max_sim_idx]
             min_sim_val = min(similarities)
             avg_sim_val = sum(similarities) / len(similarities)
             
-            # DEBUG: Log similarity statistics for replacement
             if len(buffer) < 3:
                 print(f"[Episodic Memory DEBUG] Similarity-based replacement: "
                       f"replacing idx {max_sim_idx} (sim={max_sim_val:.4f}), "
                       f"min_sim={min_sim_val:.4f}, avg_sim={avg_sim_val:.4f}")
             
-            # Algorithm 1 Line 19: E_{t+1}[j*] ← H_t
-            # Replace the most similar (redundant) element with the new one
-            # This ensures episodic memory maintains diverse, salient information
+            # Algorithm 1 Line 19: E_{t+1}[j*] ← H_t (full sequence)
             old_elem = buffer[max_sim_idx].clone()
-            buffer[max_sim_idx] = H_t
+            buffer[max_sim_idx] = H_t_storage
             
             # DEBUG: Verify replacement happened
             new_elem = buffer[max_sim_idx]

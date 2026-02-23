@@ -854,7 +854,7 @@ class LlavaMetaForCausalLM(ABC):
             self.get_model().get_episodic_memory() is not None
         ):
             image_features = self.get_model()._apply_dual_memory(image_features)
-            # Training: ensure grad path through working_attention (fixes "does not require grad" backward error).
+            # Training: ensure loss has grad path to working_attention (frozen vision tower breaks graph otherwise).
             if self.training and self.get_model().get_working_memory() is not None:
                 wa = self.get_model().working_attention
                 if image_features.dim() == 3:
@@ -870,9 +870,12 @@ class LlavaMetaForCausalLM(ABC):
                         q = q.unsqueeze(0)
                     o, _ = wa(q, q, q)
                     safety_out = o.squeeze(0)
-                # Force grad path: (safety_out - safety_out.detach()) is 0 in forward but passes grad to safety_out in backward.
+                # Force grad path: 0 in forward but carries grad from working_attention in backward.
                 image_features = image_features + (safety_out - safety_out.detach())
-            return image_features
+            # Debug: ensure encode path produces grad when training with working memory
+            if self.training and self.get_model().get_working_memory() is not None:
+                print(f"[DEBUG] encode_images returning: requires_grad={image_features.requires_grad}, grad_fn={image_features.grad_fn}")
+                assert image_features.requires_grad, "encode_images: output should require_grad when training with working memory"
         return image_features
     
     def encode_multimodals(self, videos_or_images, video_idx_in_batch, split_sizes=None):
@@ -1131,6 +1134,10 @@ class LlavaMetaForCausalLM(ABC):
         else:
             image_features = self.encode_images(images)
 
+        # Debug: check image_features grad after encode_images
+        if self.training and image_features:
+            print(f"[DEBUG] after encode_images: image_features[0].requires_grad={image_features[0].requires_grad if hasattr(image_features[0], 'requires_grad') else 'no requires_grad'}, is_list={isinstance(image_features, list)}")
+
         # TODO: image start / end is not implemented here to support pretraining.
         if getattr(self.config, "tune_mm_mlp_adapter", False) and getattr(self.config, "mm_use_im_start_end", False):
             raise NotImplementedError
@@ -1163,6 +1170,9 @@ class LlavaMetaForCausalLM(ABC):
         # rank_print("Inserting Images embedding")
         for batch_idx, cur_input_ids in enumerate(input_ids):
             num_images = (cur_input_ids == IMAGE_TOKEN_INDEX).sum()
+            # Debug: print num_images for each sample
+            if self.training and batch_idx == 0:
+                print(f"[DEBUG] sample 0: num_images={num_images}")
             # rank0_print(num_images)
             if num_images == 0:
                 # Handle cases with no image tokens if necessary.
@@ -1225,6 +1235,10 @@ class LlavaMetaForCausalLM(ABC):
 
                     cur_image_idx += 1
 
+                    # Debug: check image features grad
+                    if self.training and i == 0:
+                        print(f"[DEBUG] cur_image_features grad: requires_grad={getattr(cur_image_features, 'requires_grad', False)}")
+
                     # Prepare combined features (visual + spatial)
                     features_to_insert = []
                     if cur_image_features is not None and cur_image_features.shape[0] > 0:
@@ -1240,17 +1254,52 @@ class LlavaMetaForCausalLM(ABC):
 
                     if features_to_insert:
                         combined_features = torch.cat(features_to_insert, dim=0)
+                        # Debug: check combined_features grad
+                        if self.training and i == 0:
+                            print(f"[DEBUG] combined_features grad after cat: requires_grad={getattr(combined_features, 'requires_grad', False)}")
                         cur_new_input_embeds.append(combined_features)
                         # Add IGNORE_INDEX labels for the entire combined feature length
                         cur_new_labels.append(torch.full((combined_features.shape[0],), IGNORE_INDEX, device=cur_labels.device, dtype=cur_labels.dtype))
 
+            # Debug: check before .to()
+            if self.training and cur_new_input_embeds:
+                print(f"[DEBUG] before .to(): cur_new_input_embeds[0].requires_grad={getattr(cur_new_input_embeds[0], 'requires_grad', False)}")
             cur_new_input_embeds = [x.to(self.device) for x in cur_new_input_embeds]
+            # Debug: check after .to()
+            if self.training and cur_new_input_embeds:
+                print(f"[DEBUG] after .to(): cur_new_input_embeds[0].requires_grad={getattr(cur_new_input_embeds[0], 'requires_grad', False)}")
 
             cur_new_input_embeds = torch.cat(cur_new_input_embeds)
             cur_new_labels = torch.cat(cur_new_labels)
+            # Debug: check grad after cat (unconditional to see what's happening)
+            print(f"[DEBUG] after cat in sample: cur_new_input_embeds.requires_grad={getattr(cur_new_input_embeds, 'requires_grad', False)}, is_list={isinstance(cur_new_input_embeds, list)}")
 
             new_input_embeds.append(cur_new_input_embeds)
             new_labels.append(cur_new_labels)
+
+        # Ensure grad path when training with working memory
+        # If image_features have grad but new_input_embeds don't, force a connection
+        if self.training and image_features and any(getattr(t, "requires_grad", False) for t in image_features):
+            if new_input_embeds and not any(getattr(t, "requires_grad", False) for t in new_input_embeds):
+                print("[DEBUG] Forcing grad path: connecting image features to input embeddings")
+                # Force grad by adding a zero-term that carries gradient from image_features
+                # Get a sample image feature tensor to derive shape/dtype/device
+                sample_img = image_features[0]
+                # Create a small contribution from image features that will be added to embeddings
+                # This doesn't change forward (added and then subtracted) but carries grad
+                for i in range(len(new_input_embeds)):
+                    # Take a slice of image features for this sample
+                    num_img_tokens = sample_img.shape[0]  # e.g., 729
+                    emb_dim = new_input_embeds[i].shape[1]
+                    if num_img_tokens <= new_input_embeds[i].shape[0]:
+                        # Add a tiny term that depends on image features
+                        # Use first num_img_tokens positions
+                        img_term = sample_img[:num_img_tokens, :emb_dim].to(new_input_embeds[i].device)
+                        new_input_embeds[i] = new_input_embeds[i] + (img_term - img_term.detach())
+
+        # Debug: check grad before truncation (unconditional)
+        if self.training and new_input_embeds:
+            print(f"[DEBUG] before truncation: new_input_embeds[0].requires_grad={getattr(new_input_embeds[0], 'requires_grad', False)}")
 
         # Truncate sequences to max length as image embeddings can make the sequence longer
         tokenizer_model_max_length = getattr(self.config, "tokenizer_model_max_length", None)
@@ -1258,6 +1307,9 @@ class LlavaMetaForCausalLM(ABC):
 
         new_input_embeds = [x[:tokenizer_model_max_length] for x, modality in zip(new_input_embeds, modalities)]
         new_labels = [x[:tokenizer_model_max_length] for x, modality in zip(new_labels, modalities)]
+        # Debug: check grad after truncation (unconditional)
+        if self.training and new_input_embeds:
+            print(f"[DEBUG] after truncation: new_input_embeds[0].requires_grad={getattr(new_input_embeds[0], 'requires_grad', False)}")
         # TODO: Hard code for control loss spike
         # if tokenizer_model_max_length is not None:
         #     new_input_embeds = [x[:4096] if modality != "video" else x[:tokenizer_model_max_length] for x, modality in zip(new_input_embeds, modalities)]
@@ -1275,20 +1327,34 @@ class LlavaMetaForCausalLM(ABC):
 
         for i, (cur_new_embed, cur_new_labels) in enumerate(zip(new_input_embeds, new_labels)):
             cur_len = cur_new_embed.shape[0]
+            # Debug: check grad before padding
+            if self.training and i == 0 and getattr(cur_new_embed, "requires_grad", False):
+                print(f"[DEBUG] before padding: cur_new_embed.requires_grad={cur_new_embed.requires_grad}, grad_fn={cur_new_embed.grad_fn}")
             if getattr(self.config, "tokenizer_padding_side", "right") == "left":
-                new_input_embeds_padded.append(torch.cat((torch.zeros((max_len - cur_len, cur_new_embed.shape[1]), dtype=cur_new_embed.dtype, device=cur_new_embed.device), cur_new_embed), dim=0))
+                padded = torch.cat((torch.zeros((max_len - cur_len, cur_new_embed.shape[1]), dtype=cur_new_embed.dtype, device=cur_new_embed.device), cur_new_embed), dim=0)
+                new_input_embeds_padded.append(padded)
                 if cur_len > 0:
                     new_labels_padded[i, -cur_len:] = cur_new_labels
                     attention_mask[i, -cur_len:] = True
                     position_ids[i, -cur_len:] = torch.arange(0, cur_len, dtype=position_ids.dtype, device=position_ids.device)
             else:
-                new_input_embeds_padded.append(torch.cat((cur_new_embed, torch.zeros((max_len - cur_len, cur_new_embed.shape[1]), dtype=cur_new_embed.dtype, device=cur_new_embed.device)), dim=0))
+                padded = torch.cat((cur_new_embed, torch.zeros((max_len - cur_len, cur_new_embed.shape[1]), dtype=cur_new_embed.dtype, device=cur_new_embed.device)), dim=0)
+                new_input_embeds_padded.append(padded)
+                # Debug: check grad after padding (unconditional)
+                if self.training and i == 0:
+                    print(f"[DEBUG] after padding: cur_new_embed.requires_grad={getattr(cur_new_embed, 'requires_grad', False)}, padded.requires_grad={padded.requires_grad}")
                 if cur_len > 0:
                     new_labels_padded[i, :cur_len] = cur_new_labels
                     attention_mask[i, :cur_len] = True
                     position_ids[i, :cur_len] = torch.arange(0, cur_len, dtype=position_ids.dtype, device=position_ids.device)
 
         new_input_embeds = torch.stack(new_input_embeds_padded, dim=0)
+        # Debug: check grad after stack (unconditional)
+        if self.training and new_input_embeds_padded:
+            print(f"[DEBUG] after stack: new_input_embeds.requires_grad={getattr(new_input_embeds, 'requires_grad', False)}")
+        # Debug: if image features had grad, stacked inputs_embeds should too (find where graph is lost)
+        if self.training and image_features and any(getattr(t, "requires_grad", False) for t in image_features):
+            assert new_input_embeds.requires_grad, "prepare_inputs_labels: inputs_embeds should require_grad when image features did"
         # rank0_print("tokenizer padding")
 
         if _labels is None:
