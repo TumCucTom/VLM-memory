@@ -854,7 +854,18 @@ class LlavaMetaForCausalLM(ABC):
             self.get_model().get_episodic_memory() is not None
         ):
             image_features = self.get_model()._apply_dual_memory(image_features)
-        
+            if self.training and not image_features.requires_grad and self.get_model().get_working_memory() is not None:
+                if image_features.dim() == 3:
+                    out_list = []
+                    for i in range(image_features.shape[0]):
+                        q = image_features[i : i + 1].unsqueeze(0)
+                        o, _ = self.get_model().working_attention(q, q, q)
+                        out_list.append(o.squeeze(0).squeeze(0))
+                    image_features = torch.stack(out_list, dim=0)
+                else:
+                    q = image_features.unsqueeze(0) if image_features.dim() == 2 else image_features.unsqueeze(0)
+                    o, _ = self.get_model().working_attention(q, q, q)
+                    image_features = o.squeeze(0)
         return image_features
     
     def encode_multimodals(self, videos_or_images, video_idx_in_batch, split_sizes=None):

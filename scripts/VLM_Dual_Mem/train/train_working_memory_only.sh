@@ -122,7 +122,7 @@ ACCELERATE_CPU_AFFINITY=0 torchrun \
     --logging_steps 1 \
     --tf32 True \
     --model_max_length 32768 \
-    --gradient_checkpointing True \
+    --gradient_checkpointing False \
     --dataloader_num_workers 2 \
     --lazy_preprocess True \
     --report_to wandb \
