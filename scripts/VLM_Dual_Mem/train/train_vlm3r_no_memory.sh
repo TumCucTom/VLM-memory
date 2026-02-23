@@ -1,6 +1,6 @@
 #!/bin/bash
-# Train VLM-3R as-is: base + task LoRA merged, no memory components (no dual_memory training).
-# Same as train_working_memory_only.sh except memory is not used/trained.
+# Pipeline test: train VLM-3R for 1 step (no memory) to verify train->eval pipeline.
+# Trainable: only fusion_block (mm_tunable_parts). LR=0 and max_steps=1 so no effective weight update.
 
 set -e
 export OMP_NUM_THREADS=8
@@ -21,19 +21,20 @@ SPATIAL_TOWER_SELECT_FEATURE="patch_tokens"
 SPATIAL_FEATURE_DIM=768
 FUSION_BLOCK="cross_attention"
 
-# No memory: do not train memory components (mm_tunable_parts empty)
+# Pipeline test: train one small part (fusion_block) for 1 step with negligible LR so model ~unchanged
 MEMORY_MODE="working_only"
 MEMORY_L_W=8
 MEMORY_L_E=32
 MEMORY_NUM_HEADS=8
 MEMORY_DROPOUT=0.1
 
-# Training (reasonable hyperparameters). Smaller effective batch (fewer accumulation steps) to reduce per-step time and avoid NCCL timeout on multinode.
-NUM_TRAIN_EPOCHS=3
-LEARNING_RATE=1e-4
+# 1 step only, LR=0 so no weight change — checkpoint equals baseline (no memory)
+NUM_TRAIN_EPOCHS=1
+MAX_STEPS=1
+LEARNING_RATE=0
 BATCH_SIZE=1
-GRADIENT_ACCUMULATION_STEPS=16
-SAVE_TOTAL_LIMIT=3
+GRADIENT_ACCUMULATION_STEPS=1
+SAVE_TOTAL_LIMIT=1
 # Resume: set RESUME_FROM_CHECKPOINT=true (or path to checkpoint) to resume; default is no resume
 RESUME_FROM_CHECKPOINT="${RESUME_FROM_CHECKPOINT:-}"
 
@@ -42,11 +43,11 @@ DATA_YAML="${DATA_YAML:-scripts/VLM_3R/vsibench_data.yaml}"
 IMAGE_FOLDER="data/vlm_3r_data"
 VIDEO_FOLDER="data/vlm_3r_data"
 
-RUN_NAME="vlm2-vlm3r-no-memory"
+RUN_NAME="vlm2-vlm3r-pipeline-test"
 OUTPUT_DIR="work_dirs/${RUN_NAME}"
 
 echo "=========================================="
-echo "VLM-3R no memory (train as-is, no dual_memory)"
+echo "Pipeline test: VLM-3R 1 step (fusion_block), no memory — eval should match baseline"
 echo "=========================================="
 echo "Model: ${MODEL_PATH}"
 echo "Output: ${OUTPUT_DIR}"
@@ -91,7 +92,7 @@ ACCELERATE_CPU_AFFINITY=0 torchrun \
     --memory_L_e ${MEMORY_L_E} \
     --memory_num_heads ${MEMORY_NUM_HEADS} \
     --memory_dropout ${MEMORY_DROPOUT} \
-    --mm_tunable_parts "" \
+    --mm_tunable_parts "fusion_block" \
     --vision_tower ${VISION_MODEL_VERSION} \
     --mm_projector_type mlp2x_gelu \
     --mm_vision_select_layer -2 \
@@ -106,12 +107,13 @@ ACCELERATE_CPU_AFFINITY=0 torchrun \
     --output_dir ${OUTPUT_DIR} \
     $([[ -n "${RESUME_FROM_CHECKPOINT}" ]] && echo --resume_from_checkpoint "${RESUME_FROM_CHECKPOINT}") \
     --num_train_epochs ${NUM_TRAIN_EPOCHS} \
+    --max_steps ${MAX_STEPS:-1} \
     --per_device_train_batch_size ${BATCH_SIZE} \
     --per_device_eval_batch_size 4 \
     --gradient_accumulation_steps ${GRADIENT_ACCUMULATION_STEPS} \
     --evaluation_strategy "no" \
     --save_strategy "steps" \
-    --save_steps 2 \
+    --save_steps 1 \
     --save_total_limit ${SAVE_TOTAL_LIMIT} \
     --learning_rate ${LEARNING_RATE} \
     --weight_decay 0. \

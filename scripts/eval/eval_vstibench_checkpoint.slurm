@@ -30,12 +30,15 @@ PROJECT_DIR="${PROJECT_DIR:-$HOME/scratch/VLM-memory}"
 cd "$PROJECT_DIR"
 mkdir -p logs/eval
 
+# For pipeline-test / no-memory checkpoints set EVAL_USE_DUAL_MEMORY=False
 export EVAL_CHECKPOINT="${EVAL_CHECKPOINT:-${PROJECT_DIR}/work_dirs/vlm2-working-memory-only-Lw8/checkpoint-4}"
+export EVAL_USE_DUAL_MEMORY="${EVAL_USE_DUAL_MEMORY:-True}"
 export PYTHONWARNINGS=ignore
 export TOKENIZERS_PARALLELISM=false
 export LMMS_EVAL_LAUNCHER="accelerate"
 export NUM_GPUS_PER_NODE=${SLURM_GPUS_ON_NODE:-4}
 export NUM_GPUS=$NUM_GPUS_PER_NODE
+export NNODES=1
 
 cd thinking-in-space
 mkdir -p logs

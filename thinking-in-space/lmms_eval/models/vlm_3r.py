@@ -1,5 +1,6 @@
 import copy
 import math
+import os
 from datetime import timedelta
 from typing import List, Optional, Tuple, Union
 
@@ -82,6 +83,7 @@ class Vlm3r(lmms):
         model_name: str = None,
         model_base: str = None,
         use_dual_memory: bool = True,
+        checkpoint_adapter: str = None,  # optional: load base+LoRA then overlay adapter from this path (for pipeline verification)
         **kwargs,
     ) -> None:
         super().__init__()
@@ -142,6 +144,18 @@ class Vlm3r(lmms):
             overwrite_config["use_dual_memory"] = use_dual_memory
             # overwrite_config["attn_implementation"] = attn_implementation
 
+            # When using checkpoint_adapter, merge memory config from checkpoint so model is built with memory modules (good base + overlay)
+            if checkpoint_adapter and model_base and os.path.isdir(checkpoint_adapter):
+                _ckpt_config_path = os.path.join(checkpoint_adapter, "config.json")
+                if os.path.isfile(_ckpt_config_path):
+                    import json
+                    with open(_ckpt_config_path) as _f:
+                        _ckpt_cfg = json.load(_f)
+                    for _k in ("working_memory_size", "episodic_memory_size", "episodic_memory_gated_attention", "memory_fusion_hidden_dim", "memory_mode"):
+                        if _k in _ckpt_cfg:
+                            overwrite_config[_k] = _ckpt_cfg[_k]
+                    eval_logger.info(f"Merged memory config from checkpoint: {[k for k in overwrite_config if k in ('working_memory_size', 'episodic_memory_size', 'episodic_memory_gated_attention', 'memory_fusion_hidden_dim', 'memory_mode')]}")
+
             cfg_pretrained = AutoConfig.from_pretrained(self.pretrained)
 
             if cfg_pretrained.architectures[0] == "LlavaLlamaForCausalLM":  # Ugly code, only used in  vicuna that needs ROPE
@@ -191,6 +205,36 @@ class Vlm3r(lmms):
                 self.model_name,
                 device_map=self.device_map,
             )
+
+        # Overlay adapter + memory weights from checkpoint (good base from base+LoRA, then overlay trained adapter/memory)
+        if checkpoint_adapter and model_base and os.path.isdir(checkpoint_adapter):
+            from safetensors.torch import load_file
+            _adapter_prefixes = (
+                "model.fusion_block.",
+                "model.model.mm_projector.",
+                "model.model.vision_resampler.",
+                "model.model.working_memory.",
+                "model.model.episodic_memory.",
+                "model.model.memory_fusion_mlp.",
+                "model.model.spatial_tower.",
+            )
+            index_path = os.path.join(checkpoint_adapter, "model.safetensors.index.json")
+            if os.path.isfile(index_path):
+                import json
+                with open(index_path) as f:
+                    index = json.load(f)
+                weight_map = index.get("weight_map", {})
+                adapter_keys = [k for k in weight_map if any(k.startswith(p) for p in _adapter_prefixes)]
+                if adapter_keys:
+                    state = {}
+                    for shard in sorted(set(weight_map.values())):
+                        path = os.path.join(checkpoint_adapter, shard)
+                        if os.path.isfile(path):
+                            state.update(load_file(path))
+                    adapter_dict = {k: state[k] for k in adapter_keys if k in state}
+                    if adapter_dict:
+                        self._model.load_state_dict(adapter_dict, strict=False)
+                        eval_logger.info(f"Overlaid {len(adapter_dict)} adapter weights from {checkpoint_adapter}")
 
         self._config = self._model.config
         self.model.eval()
@@ -375,6 +419,15 @@ class Vlm3r(lmms):
         pbar = tqdm(total=len(requests), disable=(self.rank != 0), desc="Model Responding")
 
         for contexts, gen_kwargs, doc_to_visual, doc_id, task, split in [reg.args for reg in requests]:
+            # Clear dual memory before each sample so state does not leak across videos (VLM² per-video memory).
+            _model = self.model
+            if hasattr(_model, "base_model") and hasattr(_model.base_model, "model"):
+                _model = _model.base_model.model
+            elif hasattr(_model, "get_base_model"):
+                _model = _model.get_base_model()
+            if getattr(_model, "clear_all_memory", None) is not None:
+                _model.clear_all_memory()
+
             # encode, pad, and truncate contexts for this batch
             visuals = [doc_to_visual(self.task_dict[task][split][doc_id])]
             if visuals != [None]:

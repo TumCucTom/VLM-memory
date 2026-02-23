@@ -3,8 +3,9 @@
 #SBATCH --output=logs/train/vlm3r_no_memory_%j.out
 #SBATCH --error=logs/train/vlm3r_no_memory_%j.err
 #SBATCH --time=24:00:00
-#SBATCH --nodes=8
-#SBATCH --ntasks=8
+# Pipeline test: 1 step only — use 1 node to avoid multinode NCCL issues
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=400G

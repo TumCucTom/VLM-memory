@@ -1,6 +1,6 @@
 #!/bin/bash
-# Train with everything frozen except working memory (size 8).
-# Dual memory and episodic memory components are disabled (memory_mode=working_only).
+# Train with everything frozen except memory. Trainable: only memory (mm_tunable_parts=dual_memory).
+# working_only = working memory only; episodic and fusion disabled.
 
 set -e
 export OMP_NUM_THREADS=8

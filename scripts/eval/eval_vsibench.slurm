@@ -3,9 +3,8 @@
 #SBATCH --output=logs/eval/vsibench_%j.out
 #SBATCH --error=logs/eval/vsibench_%j.err
 #SBATCH --time=12:00:00
-#SBATCH --nodes=4
-#SBATCH --ntasks=4
-#SBATCH --ntasks-per-node=1
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=128G
 #SBATCH --gres=gpu:4
@@ -51,15 +50,9 @@ mkdir -p logs
 export PYTHONWARNINGS=ignore
 export TOKENIZERS_PARALLELISM=false
 export LMMS_EVAL_LAUNCHER="accelerate"
-export NUM_GPUS_PER_NODE=${SLURM_GPUS_ON_NODE:-4}
-export NUM_GPUS=$NUM_GPUS_PER_NODE
-# 4-node: first node is master; srun runs one task per node so each gets correct NODE_RANK
-export NNODES=${SLURM_NNODES:-4}
-export NODE_RANK=${SLURM_PROCID:-0}
-export MASTER_ADDR=$(scontrol show hostnames "$SLURM_NODELIST" | head -1)
-export MASTER_PORT=${MASTER_PORT:-29500}
+export NUM_GPUS=${SLURM_GPUS_ON_NODE:-4}
 
-srun bash eval_vlm_3r_vsibench.sh
+bash eval_vlm_3r_vsibench.sh
 
 echo "End Time: $(date)"
 echo "Job completed"
