@@ -518,6 +518,10 @@ class LLaVATrainer(Trainer):
             if self.args.local_rank == 0 or self.args.local_rank == -1:
                 self.model.config.save_pretrained(output_dir)
                 torch.save(weight_to_save, os.path.join(output_dir, f"mm_projector.bin"))
+                # Also save non-LoRA trainables (working_memory, episodic_memory, etc.) for evaluation
+                base_model = model.module if hasattr(model, "module") else model
+                non_lora_state_dict = get_peft_state_non_lora_maybe_zero_3(base_model.named_parameters())
+                torch.save(non_lora_state_dict, os.path.join(output_dir, "non_lora_trainables.bin"))
 
         # 保存其他训练状态（优化器状态等）
         super(LLaVATrainer, self)._save_checkpoint(model, trial, metrics)

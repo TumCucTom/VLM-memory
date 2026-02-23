@@ -209,6 +209,10 @@ class Vlm3r(lmms):
         # Overlay adapter + memory weights from checkpoint (good base from base+LoRA, then overlay trained adapter/memory)
         if checkpoint_adapter and model_base and os.path.isdir(checkpoint_adapter):
             from safetensors.torch import load_file
+            # DEBUG: List all files in checkpoint dir
+            eval_logger.info(f"[DEBUG] checkpoint_adapter path: {checkpoint_adapter}")
+            checkpoint_files = os.listdir(checkpoint_adapter)
+            eval_logger.info(f"[DEBUG] Files in checkpoint dir: {checkpoint_files}")
             # State_dict keys use one "model." prefix for LLaVA parts (LlavaQwenForCausalLM.model = LlavaQwenModel).
             # "model.model." is the inner Qwen2Model; memory/projectors live under "model.*".
             _adapter_prefixes = (
@@ -230,6 +234,7 @@ class Vlm3r(lmms):
                     index = json.load(f)
                 weight_map = index.get("weight_map", {})
                 adapter_keys = [k for k in weight_map if any(k.startswith(p) for p in _adapter_prefixes)]
+                eval_logger.info(f"[DEBUG] Found {len(adapter_keys)} adapter keys matching memory/projector prefixes")
                 if adapter_keys:
                     state = {}
                     for shard in sorted(set(weight_map.values())):
@@ -240,15 +245,25 @@ class Vlm3r(lmms):
                     if adapter_dict:
                         self._model.load_state_dict(adapter_dict, strict=False)
                         eval_logger.info(f"Overlaid {len(adapter_dict)} adapter weights from safetensors in {checkpoint_adapter}")
+            else:
+                eval_logger.warning(f"[DEBUG] No model.safetensors.index.json found at {index_path}")
             # 2) Overlay non-LoRA trainables (working_memory, episodic_memory, projectors, etc.) — same key handling as builder
             non_lora_path = os.path.join(checkpoint_adapter, "non_lora_trainables.bin")
+            eval_logger.info(f"[DEBUG] Checking for non_lora_trainables.bin at: {non_lora_path}, exists: {os.path.isfile(non_lora_path)}")
             if os.path.isfile(non_lora_path):
                 non_lora = torch.load(non_lora_path, map_location="cpu", weights_only=True)
+                eval_logger.info(f"[DEBUG] non_lora keys before normalization: {list(non_lora.keys())[:10]}... (total {len(non_lora)})")
                 non_lora = {(k[11:] if k.startswith("base_model.") else k): v for k, v in non_lora.items()}
                 if any(k.startswith("model.model.") for k in non_lora):
                     non_lora = {(k[6:] if k.startswith("model.") else k): v for k, v in non_lora.items()}
+                eval_logger.info(f"[DEBUG] non_lora keys after normalization: {list(non_lora.keys())[:10]}... (total {len(non_lora)})")
+                # DEBUG: check if working_memory keys are present
+                wm_keys = [k for k in non_lora.keys() if "working_memory" in k]
+                eval_logger.info(f"[DEBUG] working_memory keys in non_lora: {wm_keys}")
                 self._model.load_state_dict(non_lora, strict=False)
                 eval_logger.info(f"Overlaid {len(non_lora)} non-LoRA trainables (e.g. working/episodic memory) from {non_lora_path}")
+            else:
+                eval_logger.warning(f"[DEBUG] non_lora_trainables.bin NOT FOUND at {non_lora_path}")
 
         self._config = self._model.config
         self.model.eval()

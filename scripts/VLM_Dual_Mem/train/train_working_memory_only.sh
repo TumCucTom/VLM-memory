@@ -28,11 +28,11 @@ MEMORY_L_E=32
 MEMORY_NUM_HEADS=8
 MEMORY_DROPOUT=0.1
 
-# Training (reasonable hyperparameters). Smaller effective batch (fewer accumulation steps) to reduce per-step time and avoid NCCL timeout on multinode.
+# Training: hyperparams for 8-node (32 GPU) run. Effective batch = num_gpus * batch_size * grad_accum = 32*1*4 = 128.
 NUM_TRAIN_EPOCHS=3
-LEARNING_RATE=1e-4
+LEARNING_RATE=1e-3
 BATCH_SIZE=1
-GRADIENT_ACCUMULATION_STEPS=16
+GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-4}"
 SAVE_TOTAL_LIMIT=3
 # Resume: set RESUME_FROM_CHECKPOINT=true (or path to checkpoint) to resume; default is no resume
 RESUME_FROM_CHECKPOINT="${RESUME_FROM_CHECKPOINT:-}"
@@ -112,7 +112,7 @@ ACCELERATE_CPU_AFFINITY=0 torchrun \
     --gradient_accumulation_steps ${GRADIENT_ACCUMULATION_STEPS} \
     --evaluation_strategy "no" \
     --save_strategy "steps" \
-    --save_steps 2 \
+    --save_steps 1 \
     --save_total_limit ${SAVE_TOTAL_LIMIT} \
     --learning_rate ${LEARNING_RATE} \
     --weight_decay 0. \
@@ -129,7 +129,6 @@ ACCELERATE_CPU_AFFINITY=0 torchrun \
     --torch_compile_backend "inductor" \
     --dataloader_drop_last True \
     --frames_upbound ${FRAMES_UPBOUND:-32} \
-
     --mm_newline_position grid
 
 echo "=========================================="
