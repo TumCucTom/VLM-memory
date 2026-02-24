@@ -26,13 +26,15 @@ echo "Job ID: $SLURM_JOB_ID" && echo "Start Time: $(date)"
 source ~/miniforge3/bin/activate
 conda activate vlm3r
 
-PROJECT_DIR="${PROJECT_DIR:-$HOME/scratch/VLM-memory}"
+export PROJECT_DIR="${PROJECT_DIR:-$HOME/scratch/VLM-memory}"
 cd "$PROJECT_DIR"
 mkdir -p logs/eval
 
-# Checkpoint to eval (set EVAL_CHECKPOINT before sbatch). Eval always uses adapter-overlay (base+LoRA + overlay) so memory is on the good base. Set EVAL_USE_DUAL_MEMORY=False for no-memory checkpoints.
-export EVAL_CHECKPOINT="${EVAL_CHECKPOINT:-${PROJECT_DIR}/work_dirs/vlm2-working-memory-only-Lw8/checkpoint-4}"
+# Checkpoint to eval (set EVAL_CHECKPOINT before sbatch to override). Default: working-memory training run (use run dir so non_lora_trainables.bin is found; or use run_dir/checkpoint-N). Eval uses adapter-overlay (base+LoRA + overlay). Set EVAL_USE_DUAL_MEMORY=False for no-memory checkpoints.
+# For untrained-memory baseline (keep base ~60%%): set EVAL_OVERLAY_MEMORY_ONLY=True so only working/episodic memory weights are overlaid; otherwise full checkpoint overlay can overwrite fusion_block and drop to ~1%%.
+export EVAL_CHECKPOINT="${EVAL_CHECKPOINT:-work_dirs/vlm2-working-memory-only-Lw8}"
 export EVAL_USE_DUAL_MEMORY="${EVAL_USE_DUAL_MEMORY:-True}"
+export EVAL_OVERLAY_MEMORY_ONLY="${EVAL_OVERLAY_MEMORY_ONLY:-False}"
 export PYTHONWARNINGS=ignore
 export TOKENIZERS_PARALLELISM=false
 export LMMS_EVAL_LAUNCHER="accelerate"

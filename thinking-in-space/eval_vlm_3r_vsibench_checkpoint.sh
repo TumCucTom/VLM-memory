@@ -35,8 +35,9 @@ if [ "$NNODES" -gt 1 ]; then
 fi
 
 # Base+LoRA + overlay adapter/memory from checkpoint (good base for all checkpoints)
-# Do not set model_name so builder gets name from pretrained path (contains 'lora') and uses LoRA branch with non_lora_trainables.bin from HF
-MODEL_ARGS="pretrained=${EVAL_LORA_PATH},model_base=${EVAL_MODEL_BASE},checkpoint_adapter=${CHECKPOINT},conv_template=qwen_1_5,max_frames_num=32,use_dual_memory=${USE_DUAL_MEMORY}"
+# Set EVAL_OVERLAY_MEMORY_ONLY=True to only overlay working/episodic memory weights so base+LoRA (~60%) is preserved (for untrained-memory baseline).
+OVERLAY_MEMORY_ONLY="${EVAL_OVERLAY_MEMORY_ONLY:-False}"
+MODEL_ARGS="pretrained=${EVAL_LORA_PATH},model_base=${EVAL_MODEL_BASE},checkpoint_adapter=${CHECKPOINT},conv_template=qwen_1_5,max_frames_num=32,use_dual_memory=${USE_DUAL_MEMORY},overlay_memory_only=${OVERLAY_MEMORY_ONLY}"
 accelerate launch \
     "${LAUNCH_ARGS[@]}" \
     -m lmms_eval \

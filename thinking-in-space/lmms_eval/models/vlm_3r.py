@@ -84,6 +84,7 @@ class Vlm3r(lmms):
         model_base: str = None,
         use_dual_memory: bool = True,
         checkpoint_adapter: str = None,  # optional: load base+LoRA then overlay adapter from this path (for pipeline verification)
+        overlay_memory_only: bool = False,  # if True, only overlay working/episodic memory weights so base+LoRA (~60%%) stays intact; use for untrained-memory baseline
         **kwargs,
     ) -> None:
         super().__init__()
@@ -144,7 +145,8 @@ class Vlm3r(lmms):
             overwrite_config["use_dual_memory"] = use_dual_memory
             # overwrite_config["attn_implementation"] = attn_implementation
 
-            # When using checkpoint_adapter, merge memory config from checkpoint so model is built with memory modules (good base + overlay)
+            # When using checkpoint_adapter, merge memory config from checkpoint so model is built with memory modules (good base + overlay).
+            # Spatial/fusion (spatial_tower, fusion_block, etc.) stay from HF pretrained — just in case.
             if checkpoint_adapter and model_base and os.path.isdir(checkpoint_adapter):
                 _ckpt_config_path = os.path.join(checkpoint_adapter, "config.json")
                 if os.path.isfile(_ckpt_config_path):
@@ -211,7 +213,7 @@ class Vlm3r(lmms):
             from safetensors.torch import load_file
             # State_dict keys use one "model." prefix for LLaVA parts (LlavaQwenForCausalLM.model = LlavaQwenModel).
             # "model.model." is the inner Qwen2Model; memory/projectors live under "model.*".
-            _adapter_prefixes = (
+            _all_prefixes = (
                 "model.fusion_block.",
                 "model.mm_projector.",
                 "model.vision_resampler.",
@@ -222,6 +224,16 @@ class Vlm3r(lmms):
                 "model.working_attention.",
                 "model.episodic_attention.",
             )
+            _memory_only_prefixes = (
+                "model.working_memory.",
+                "model.episodic_memory.",
+                "model.memory_fusion_mlp.",
+                "model.working_attention.",
+                "model.episodic_attention.",
+            )
+            _adapter_prefixes = _memory_only_prefixes if overlay_memory_only else _all_prefixes
+            if overlay_memory_only:
+                eval_logger.info("Overlaying only memory weights from checkpoint (base+LoRA preserved for ~60%% baseline)")
             # 1) Overlay from safetensors (LoRA shards; may also contain extra state_dict if saved that way)
             index_path = os.path.join(checkpoint_adapter, "model.safetensors.index.json")
             if os.path.isfile(index_path):
@@ -240,15 +252,18 @@ class Vlm3r(lmms):
                     if adapter_dict:
                         self._model.load_state_dict(adapter_dict, strict=False)
                         eval_logger.info(f"Overlaid {len(adapter_dict)} adapter weights from safetensors in {checkpoint_adapter}")
-            # 2) Overlay non-LoRA trainables (working_memory, episodic_memory, projectors, etc.) — same key handling as builder
+            # 2) Overlay non-LoRA trainables (working_memory, episodic_memory, etc.) — same key handling as builder
             non_lora_path = os.path.join(checkpoint_adapter, "non_lora_trainables.bin")
             if os.path.isfile(non_lora_path):
                 non_lora = torch.load(non_lora_path, map_location="cpu", weights_only=True)
                 non_lora = {(k[11:] if k.startswith("base_model.") else k): v for k, v in non_lora.items()}
                 if any(k.startswith("model.model.") for k in non_lora):
                     non_lora = {(k[6:] if k.startswith("model.") else k): v for k, v in non_lora.items()}
-                self._model.load_state_dict(non_lora, strict=False)
-                eval_logger.info(f"Overlaid {len(non_lora)} non-LoRA trainables (e.g. working/episodic memory) from {non_lora_path}")
+                if overlay_memory_only:
+                    non_lora = {k: v for k, v in non_lora.items() if any(k.startswith(p) for p in _memory_only_prefixes)}
+                if non_lora:
+                    self._model.load_state_dict(non_lora, strict=False)
+                    eval_logger.info(f"Overlaid {len(non_lora)} non-LoRA trainables from {non_lora_path}")
 
         self._config = self._model.config
         self.model.eval()
