@@ -8,7 +8,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=400G
-#SBATCH --gres=gpu:4
+#SBATCH --gres=gpu:1
 #SBATCH --partition=workq
 
 # Load CUDA (need toolkit with headers for DeepSpeed FusedAdam JIT build)
@@ -47,6 +47,17 @@ echo "CUDA devices: $(python -c 'import torch; print(torch.cuda.device_count() i
 
 PROJECT_DIR="${PROJECT_DIR:-$HOME/scratch/VLM-memory}"
 cd "$PROJECT_DIR"
+
+# Sync fixed llava files from local workspace to lustre
+LUSTRE_DIR="/lus/lfs1aip2/scratch/u5fj/trvbale.u5fj/VLM-memory"
+LOCAL_WORKSPACE="/home/u5fj/trvbale.u5fj/scratch/VLM-memory"
+if [ -d "$LOCAL_WORKSPACE" ]; then
+    echo "Syncing llava/ files to $LUSTRE_DIR..."
+    cp -f "$LOCAL_WORKSPACE/llava/model/llava_arch.py" "$LUSTRE_DIR/llava/model/llava_arch.py"
+    cp -f "$LOCAL_WORKSPACE/llava/train/llava_trainer.py" "$LUSTRE_DIR/llava/train/llava_trainer.py"
+    cp -f "$LOCAL_WORKSPACE/llava/train/train.py" "$LUSTRE_DIR/llava/train/train.py"
+fi
+
 mkdir -p logs
 
 export PYTHONWARNINGS=ignore

@@ -790,8 +790,11 @@ def preprocess_qwen(sources, tokenizer: transformers.PreTrainedTokenizer, has_im
 
         # New version, use apply chat template
         # Build system message for each sentence
-        input_id += tokenizer.apply_chat_template([{"role" : "system", "content" : system_message}])
-        target += [IGNORE_INDEX] * len(input_id)
+        system_ids = tokenizer.apply_chat_template([{"role" : "system", "content" : system_message}])
+        if system_ids and isinstance(system_ids[0], (list, tuple)):
+            system_ids = system_ids[0]
+        input_id += system_ids
+        target += [IGNORE_INDEX] * len(system_ids)
 
         for conv in source:
             # Make sure llava data can load
@@ -806,6 +809,9 @@ def preprocess_qwen(sources, tokenizer: transformers.PreTrainedTokenizer, has_im
             
             conv = [{"role" : role, "content" : content}]
             encode_id = tokenizer.apply_chat_template(conv)
+            # Flatten if batch returned (list of lists) so image token replacement works
+            if encode_id and isinstance(encode_id[0], (list, tuple)):
+                encode_id = encode_id[0]
             input_id += encode_id
             if role in ["user", "system"]:
                 target += [IGNORE_INDEX] * len(encode_id)
@@ -1115,7 +1121,7 @@ def preprocess(sources: Sequence[str], tokenizer: transformers.PreTrainedTokeniz
         return preprocess_v1(sources, tokenizer, has_image=has_image)
     if conversation_lib.default_conversation.version == "mpt":
         return preprocess_mpt(sources, tokenizer, has_image=has_image)
-    if conversation_lib.default_conversation.version == "qwen":
+    if conversation_lib.default_conversation.version in ("qwen", "qwen_1_5"):
         return preprocess_qwen(sources, tokenizer, has_image=has_image)
     if conversation_lib.default_conversation.version == "gemma":
         return preprocess_gemma(sources, tokenizer, has_image=has_image)

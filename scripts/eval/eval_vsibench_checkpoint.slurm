@@ -30,9 +30,8 @@ PROJECT_DIR="${PROJECT_DIR:-$HOME/scratch/VLM-memory}"
 cd "$PROJECT_DIR"
 mkdir -p logs/eval
 
-# Checkpoint to eval: set EVAL_CHECKPOINT before sbatch, e.g. sbatch --export=ALL,EVAL_CHECKPOINT=/path/to/checkpoint-33 eval_vsibench_checkpoint.slurm
-# Eval always uses adapter-overlay (base+LoRA + overlay). Set EVAL_USE_DUAL_MEMORY=False for no-memory checkpoints.
-export EVAL_CHECKPOINT="${EVAL_CHECKPOINT:-${PROJECT_DIR}/work_dirs/vlm2-working-memory-only-Lw8/checkpoint-33}"
+# Checkpoint to eval (set EVAL_CHECKPOINT before sbatch). Eval always uses adapter-overlay (base+LoRA + overlay) so memory is on the good base. Set EVAL_USE_DUAL_MEMORY=False for no-memory checkpoints.
+export EVAL_CHECKPOINT="${EVAL_CHECKPOINT:-${PROJECT_DIR}/work_dirs/vlm2-working-memory-only-Lw8/checkpoint-4}"
 export EVAL_USE_DUAL_MEMORY="${EVAL_USE_DUAL_MEMORY:-True}"
 export PYTHONWARNINGS=ignore
 export TOKENIZERS_PARALLELISM=false

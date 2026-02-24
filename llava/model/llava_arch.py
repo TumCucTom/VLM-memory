@@ -1175,28 +1175,26 @@ class LlavaMetaForCausalLM(ABC):
                 print(f"[DEBUG] sample 0: num_images={num_images}")
             # rank0_print(num_images)
             if num_images == 0:
-                # Handle cases with no image tokens if necessary.
-                # Original code appends empty features, adapt if needed.
+                # Video/image sample but tokenizer produced no image placeholder (num_images==0).
+                # Insert image features so the model sees them and gradient flows (fixes 0 grad_norm).
                 cur_image_features = image_features[cur_image_idx]
-                # Also get corresponding spatial features
-                # if self.get_model().get_spatial_tower() is not None:
-                #     cur_camera_tokens = camera_tokens[cur_image_idx]
-                #     cur_patch_tokens = patch_tokens[cur_image_idx]
 
                 cur_input_embeds_1 = self.get_model().embed_tokens(cur_input_ids)
 
-                # Concatenate text embeds, visual embeds [0:0], and spatial embeds [0:0]?
-                # This part of original code seems odd (using [0:0]), clarify its purpose.
-                # Assuming you want to append actual features if available, otherwise skip.
-                embeds_to_concat = [cur_input_embeds_1]
-                # if cur_image_features is not None and cur_image_features.numel() > 0:
-                #     embeds_to_concat.append(cur_image_features[0:0]) # Original behavior
-
+                embeds_to_concat = []
+                cur_labels_slice = labels[batch_idx]
+                if cur_image_features is not None and cur_image_features.shape[0] > 0:
+                    embeds_to_concat.append(cur_image_features.to(cur_input_embeds_1.device))
+                    ignore_labels = torch.full(
+                        (cur_image_features.shape[0],), IGNORE_INDEX, device=cur_labels_slice.device, dtype=cur_labels_slice.dtype
+                    )
+                    cur_labels_slice = torch.cat([ignore_labels, cur_labels_slice], dim=0)
+                embeds_to_concat.append(cur_input_embeds_1)
                 cur_input_embeds = torch.cat(embeds_to_concat, dim=0)
 
                 new_input_embeds.append(cur_input_embeds)
-                new_labels.append(labels[batch_idx])
-                cur_image_idx += 1 # Increment even if no image token? Check original logic intent.
+                new_labels.append(cur_labels_slice)
+                cur_image_idx += 1
                 continue
 
             image_token_indices = [-1] + torch.where(cur_input_ids == IMAGE_TOKEN_INDEX)[0].tolist() + [cur_input_ids.shape[0]]
