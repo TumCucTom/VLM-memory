@@ -16,6 +16,7 @@
 from abc import ABC, abstractmethod
 
 import math
+import os
 import re
 import time
 import torch
@@ -31,6 +32,9 @@ from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_PATCH
 
 from llava.mm_utils import get_anyres_image_grid_shape
 from llava.utils import rank0_print, rank_print
+
+# Set LLAVA_DEBUG_GRAD=1 to enable verbose per-step DEBUG logs (grad flow, num_images, etc.)
+_DEBUG_GRAD = os.environ.get("LLAVA_DEBUG_GRAD", "0") == "1"
 import random
 from einops import rearrange
 
@@ -182,8 +186,8 @@ class LlavaMetaModel:
             num_frames = H_t.shape[0]
             M_t_list = []
             
-            # DEBUG: Log initial memory states
-            if num_frames > 0:
+            # DEBUG: Log initial memory states (only when LLAVA_DEBUG_GRAD=1)
+            if _DEBUG_GRAD and num_frames > 0:
                 w_size = len(working_memory) if working_memory is not None else 0
                 e_size = len(episodic_memory) if episodic_memory is not None else 0
                 rank0_print(f"[DEBUG] Dual Memory System - Starting video processing: "
@@ -195,7 +199,7 @@ class LlavaMetaModel:
                 query = H_t_frame.unsqueeze(0)  # [1, N, D] for batch dimension
                 
                 # DEBUG: Log tensor shapes for first frame
-                if frame_idx == 0:
+                if _DEBUG_GRAD and frame_idx == 0:
                     rank0_print(f"[DEBUG] Frame {frame_idx}: Input H_t shape: {H_t_frame.shape}, "
                               f"query shape: {query.shape}")
                 
@@ -204,7 +208,7 @@ class LlavaMetaModel:
                 M_t_w_frame = None
                 if use_working and working_memory is not None:
                     W_t = working_memory.get_buffer()
-                    if len(W_t) > 0:
+                    if len(W_t) > 0 and _DEBUG_GRAD:
                         rank0_print(f"[Dual Memory] Frame {frame_idx}: Working memory retrieval from {len(W_t)} elements")
                         
                         # Key/value from working memory: full sequences per slot [N,D] -> concat -> [1, L_w*N, D]
@@ -225,7 +229,7 @@ class LlavaMetaModel:
                         # DEBUG: Verify attention retrieval changed the representation
                         M_t_w_frame_mean = M_t_w_frame.mean().item()
                         attn_weights_mean = attn_weights_w.mean().item() if attn_weights_w is not None else 0.0
-                        if frame_idx < 3 or frame_idx % 10 == 0:
+                        if _DEBUG_GRAD and (frame_idx < 3 or frame_idx % 10 == 0):
                             rank0_print(f"[DEBUG] Frame {frame_idx}: Working attention retrieval - "
                                       f"H_t mean: {H_t_frame_mean:.4f}, M_t^w mean: {M_t_w_frame_mean:.4f}, "
                                       f"attn_weights mean: {attn_weights_mean:.4f}")
@@ -238,7 +242,7 @@ class LlavaMetaModel:
                     else:
                         # Buffer empty (e.g. first frame or single image): still pass through working_attention
                         # so the loss has a grad path to trainable params (fixes "does not require grad" backward error).
-                        if frame_idx == 0:
+                        if _DEBUG_GRAD and frame_idx == 0:
                             rank0_print(f"[Dual Memory] Frame {frame_idx}: Working memory empty (first frame), passing through working_attention for grad path")
                         M_t_w_frame, _ = self.working_attention(
                             query=query, key=query, value=query
@@ -252,7 +256,7 @@ class LlavaMetaModel:
                 M_t_e_frame = None
                 if use_episodic and episodic_memory is not None:
                     E_t = episodic_memory.get_buffer()
-                    if len(E_t) > 0:
+                    if len(E_t) > 0 and _DEBUG_GRAD:
                         rank0_print(f"[Dual Memory] Frame {frame_idx}: Episodic memory retrieval from {len(E_t)} elements")
                         
                         # Key/value from episodic memory: full sequences per slot -> concat -> [1, total_seq, D]
@@ -273,7 +277,7 @@ class LlavaMetaModel:
                         # DEBUG: Verify attention retrieval changed the representation
                         M_t_e_frame_mean = M_t_e_frame.mean().item()
                         attn_weights_e_mean = attn_weights_e.mean().item() if attn_weights_e is not None else 0.0
-                        if frame_idx < 3 or frame_idx % 10 == 0:
+                        if _DEBUG_GRAD and (frame_idx < 3 or frame_idx % 10 == 0):
                             rank0_print(f"[DEBUG] Frame {frame_idx}: Episodic attention retrieval - "
                                       f"H_t mean: {H_t_frame_mean_before:.4f}, M_t^e mean: {M_t_e_frame_mean:.4f}, "
                                       f"attn_weights mean: {attn_weights_e_mean:.4f}")
@@ -285,7 +289,7 @@ class LlavaMetaModel:
                                       f"diff_norm={diff_norm:.6f}")
                     else:
                         # Buffer empty: pass through episodic_attention so loss has grad path to trainable params.
-                        if frame_idx == 0:
+                        if _DEBUG_GRAD and frame_idx == 0:
                             rank0_print(f"[Dual Memory] Frame {frame_idx}: Episodic memory empty (first frame), passing through episodic_attention for grad path")
                         M_t_e_frame, _ = self.episodic_attention(
                             query=query, key=query, value=query
@@ -309,7 +313,7 @@ class LlavaMetaModel:
                     gamma_max = gamma_t.max().item()
                     gamma_mean = gamma_t.mean().item()
                     gamma_std = gamma_t.std().item()
-                    if frame_idx < 3 or frame_idx % 10 == 0:
+                    if _DEBUG_GRAD and (frame_idx < 3 or frame_idx % 10 == 0):
                         rank0_print(f"[DEBUG] Frame {frame_idx}: Memory fusion gate γ_t - "
                                   f"min: {gamma_min:.4f}, max: {gamma_max:.4f}, "
                                   f"mean: {gamma_mean:.4f}, std: {gamma_std:.4f}")
@@ -333,7 +337,7 @@ class LlavaMetaModel:
                 
                 # DEBUG: Verify fusion produces different output
                 M_t_frame_mean = M_t_frame.mean().item()
-                if frame_idx < 3 or frame_idx % 10 == 0:
+                if _DEBUG_GRAD and (frame_idx < 3 or frame_idx % 10 == 0):
                     rank0_print(f"[DEBUG] Frame {frame_idx}: Fused memory M_t mean: {M_t_frame_mean:.4f}")
                 
                 M_t_list.append(M_t_frame)
@@ -362,11 +366,11 @@ class LlavaMetaModel:
                             if first_unchanged:
                                 rank0_print(f"[WARNING] Frame {frame_idx}: Working memory FIFO check failed! "
                                           f"First element unchanged after update when memory was full.")
-                            elif frame_idx < 3 or frame_idx % 10 == 0:
+                            elif _DEBUG_GRAD and (frame_idx < 3 or frame_idx % 10 == 0):
                                 rank0_print(f"[DEBUG] Frame {frame_idx}: Working memory FIFO verified - "
                                           f"oldest element removed (first element changed)")
                     
-                    if frame_idx < 3 or old_w_size != new_w_size:
+                    if _DEBUG_GRAD and (frame_idx < 3 or old_w_size != new_w_size):
                         rank0_print(f"[Dual Memory] Frame {frame_idx}: Working memory {old_w_size} → {new_w_size} "
                                   f"(capacity: {working_memory.L_w}, is_full: {working_memory.is_full()})")
                 
@@ -389,7 +393,7 @@ class LlavaMetaModel:
                         predicted_replace_idx = max(range(len(similarities_before)), 
                                                    key=lambda i: similarities_before[i])
                         predicted_sim = similarities_before[predicted_replace_idx]
-                        if frame_idx < 3 or frame_idx % 10 == 0:
+                        if _DEBUG_GRAD and (frame_idx < 3 or frame_idx % 10 == 0):
                             rank0_print(f"[DEBUG] Frame {frame_idx}: Episodic memory full - "
                                       f"predicted replacement at idx {predicted_replace_idx} "
                                       f"(similarity: {predicted_sim:.4f})")
@@ -411,7 +415,7 @@ class LlavaMetaModel:
                             if len(changed_indices) == 1:
                                 actual_replace_idx = changed_indices[0]
                                 if actual_replace_idx == predicted_replace_idx:
-                                    if frame_idx < 3 or frame_idx % 10 == 0:
+                                    if _DEBUG_GRAD and (frame_idx < 3 or frame_idx % 10 == 0):
                                         rank0_print(f"[DEBUG] Frame {frame_idx}: Episodic memory similarity-based "
                                                   f"replacement verified - replaced idx {actual_replace_idx} "
                                                   f"(most similar, sim={predicted_sim:.4f})")
@@ -424,7 +428,7 @@ class LlavaMetaModel:
                                 rank0_print(f"[WARNING] Frame {frame_idx}: Episodic memory multiple elements changed: "
                                           f"{changed_indices}")
                     
-                    if frame_idx < 3 or old_e_size != new_e_size:
+                    if _DEBUG_GRAD and (frame_idx < 3 or old_e_size != new_e_size):
                         rank0_print(f"[Dual Memory] Frame {frame_idx}: Episodic memory {old_e_size} → {new_e_size} "
                                   f"(capacity: {episodic_memory.L_e}, is_full: {episodic_memory.is_full()})")
             
@@ -432,12 +436,15 @@ class LlavaMetaModel:
             M_t = torch.stack(M_t_list, dim=0)  # [B*T, N, D]
             
             # DEBUG: Log final memory states after video processing
-            w_size_final = len(working_memory) if working_memory is not None else 0
-            e_size_final = len(episodic_memory) if episodic_memory is not None else 0
-            rank0_print(f"[DEBUG] Dual Memory System - Completed video processing: "
-                      f"Working Memory: {w_size_final}/{working_memory.L_w if working_memory else 0}, "
-                      f"Episodic Memory: {e_size_final}/{episodic_memory.L_e if episodic_memory else 0}, "
-                      f"Output M_t shape: {M_t.shape}")
+            if _DEBUG_GRAD:
+                w_size_final = len(working_memory) if working_memory is not None else 0
+                e_size_final = len(episodic_memory) if episodic_memory is not None else 0
+                rank0_print(
+                    f"[DEBUG] Dual Memory System - Completed video processing: "
+                    f"Working Memory: {w_size_final}/{working_memory.L_w if working_memory else 0}, "
+                    f"Episodic Memory: {e_size_final}/{episodic_memory.L_e if episodic_memory else 0}, "
+                    f"Output M_t shape: {M_t.shape}"
+                )
         else:
             # Single frame processing
             query = H_t.unsqueeze(0) if H_t.dim() == 2 else H_t.unsqueeze(0).unsqueeze(0)  # [1, N, D] or [1, 1, D]
@@ -874,7 +881,8 @@ class LlavaMetaForCausalLM(ABC):
                 image_features = image_features + (safety_out - safety_out.detach())
             # Debug: ensure encode path produces grad when training with working memory
             if self.training and self.get_model().get_working_memory() is not None:
-                print(f"[DEBUG] encode_images returning: requires_grad={image_features.requires_grad}, grad_fn={image_features.grad_fn}")
+                if _DEBUG_GRAD:
+                    print(f"[DEBUG] encode_images returning: requires_grad={image_features.requires_grad}, grad_fn={image_features.grad_fn}")
                 assert image_features.requires_grad, "encode_images: output should require_grad when training with working memory"
         return image_features
     
@@ -1136,7 +1144,8 @@ class LlavaMetaForCausalLM(ABC):
 
         # Debug: check image_features grad after encode_images
         if self.training and image_features:
-            print(f"[DEBUG] after encode_images: image_features[0].requires_grad={image_features[0].requires_grad if hasattr(image_features[0], 'requires_grad') else 'no requires_grad'}, is_list={isinstance(image_features, list)}")
+            if _DEBUG_GRAD:
+                print(f"[DEBUG] after encode_images: image_features[0].requires_grad={image_features[0].requires_grad if hasattr(image_features[0], 'requires_grad') else 'no requires_grad'}, is_list={isinstance(image_features, list)}")
 
         # TODO: image start / end is not implemented here to support pretraining.
         if getattr(self.config, "tune_mm_mlp_adapter", False) and getattr(self.config, "mm_use_im_start_end", False):
@@ -1171,7 +1180,7 @@ class LlavaMetaForCausalLM(ABC):
         for batch_idx, cur_input_ids in enumerate(input_ids):
             num_images = (cur_input_ids == IMAGE_TOKEN_INDEX).sum()
             # Debug: print num_images for each sample
-            if self.training and batch_idx == 0:
+            if _DEBUG_GRAD and self.training and batch_idx == 0:
                 print(f"[DEBUG] sample 0: num_images={num_images}")
             # rank0_print(num_images)
             if num_images == 0:
@@ -1234,7 +1243,7 @@ class LlavaMetaForCausalLM(ABC):
                     cur_image_idx += 1
 
                     # Debug: check image features grad
-                    if self.training and i == 0:
+                    if _DEBUG_GRAD and self.training and i == 0:
                         print(f"[DEBUG] cur_image_features grad: requires_grad={getattr(cur_image_features, 'requires_grad', False)}")
 
                     # Prepare combined features (visual + spatial)
@@ -1253,24 +1262,25 @@ class LlavaMetaForCausalLM(ABC):
                     if features_to_insert:
                         combined_features = torch.cat(features_to_insert, dim=0)
                         # Debug: check combined_features grad
-                        if self.training and i == 0:
+                        if _DEBUG_GRAD and self.training and i == 0:
                             print(f"[DEBUG] combined_features grad after cat: requires_grad={getattr(combined_features, 'requires_grad', False)}")
                         cur_new_input_embeds.append(combined_features)
                         # Add IGNORE_INDEX labels for the entire combined feature length
                         cur_new_labels.append(torch.full((combined_features.shape[0],), IGNORE_INDEX, device=cur_labels.device, dtype=cur_labels.dtype))
 
             # Debug: check before .to()
-            if self.training and cur_new_input_embeds:
+            if _DEBUG_GRAD and self.training and cur_new_input_embeds:
                 print(f"[DEBUG] before .to(): cur_new_input_embeds[0].requires_grad={getattr(cur_new_input_embeds[0], 'requires_grad', False)}")
             cur_new_input_embeds = [x.to(self.device) for x in cur_new_input_embeds]
             # Debug: check after .to()
-            if self.training and cur_new_input_embeds:
+            if _DEBUG_GRAD and self.training and cur_new_input_embeds:
                 print(f"[DEBUG] after .to(): cur_new_input_embeds[0].requires_grad={getattr(cur_new_input_embeds[0], 'requires_grad', False)}")
 
             cur_new_input_embeds = torch.cat(cur_new_input_embeds)
             cur_new_labels = torch.cat(cur_new_labels)
             # Debug: check grad after cat (unconditional to see what's happening)
-            print(f"[DEBUG] after cat in sample: cur_new_input_embeds.requires_grad={getattr(cur_new_input_embeds, 'requires_grad', False)}, is_list={isinstance(cur_new_input_embeds, list)}")
+            if _DEBUG_GRAD:
+                print(f"[DEBUG] after cat in sample: cur_new_input_embeds.requires_grad={getattr(cur_new_input_embeds, 'requires_grad', False)}, is_list={isinstance(cur_new_input_embeds, list)}")
 
             new_input_embeds.append(cur_new_input_embeds)
             new_labels.append(cur_new_labels)
@@ -1279,7 +1289,8 @@ class LlavaMetaForCausalLM(ABC):
         # If image_features have grad but new_input_embeds don't, force a connection
         if self.training and image_features and any(getattr(t, "requires_grad", False) for t in image_features):
             if new_input_embeds and not any(getattr(t, "requires_grad", False) for t in new_input_embeds):
-                print("[DEBUG] Forcing grad path: connecting image features to input embeddings")
+                if _DEBUG_GRAD:
+                    print("[DEBUG] Forcing grad path: connecting image features to input embeddings")
                 # Force grad by adding a zero-term that carries gradient from image_features
                 # Get a sample image feature tensor to derive shape/dtype/device
                 sample_img = image_features[0]
@@ -1296,7 +1307,7 @@ class LlavaMetaForCausalLM(ABC):
                         new_input_embeds[i] = new_input_embeds[i] + (img_term - img_term.detach())
 
         # Debug: check grad before truncation (unconditional)
-        if self.training and new_input_embeds:
+        if _DEBUG_GRAD and self.training and new_input_embeds:
             print(f"[DEBUG] before truncation: new_input_embeds[0].requires_grad={getattr(new_input_embeds[0], 'requires_grad', False)}")
 
         # Truncate sequences to max length as image embeddings can make the sequence longer
@@ -1306,7 +1317,7 @@ class LlavaMetaForCausalLM(ABC):
         new_input_embeds = [x[:tokenizer_model_max_length] for x, modality in zip(new_input_embeds, modalities)]
         new_labels = [x[:tokenizer_model_max_length] for x, modality in zip(new_labels, modalities)]
         # Debug: check grad after truncation (unconditional)
-        if self.training and new_input_embeds:
+        if _DEBUG_GRAD and self.training and new_input_embeds:
             print(f"[DEBUG] after truncation: new_input_embeds[0].requires_grad={getattr(new_input_embeds[0], 'requires_grad', False)}")
         # TODO: Hard code for control loss spike
         # if tokenizer_model_max_length is not None:
@@ -1327,7 +1338,8 @@ class LlavaMetaForCausalLM(ABC):
             cur_len = cur_new_embed.shape[0]
             # Debug: check grad before padding
             if self.training and i == 0 and getattr(cur_new_embed, "requires_grad", False):
-                print(f"[DEBUG] before padding: cur_new_embed.requires_grad={cur_new_embed.requires_grad}, grad_fn={cur_new_embed.grad_fn}")
+                if _DEBUG_GRAD:
+                    print(f"[DEBUG] before padding: cur_new_embed.requires_grad={cur_new_embed.requires_grad}, grad_fn={cur_new_embed.grad_fn}")
             if getattr(self.config, "tokenizer_padding_side", "right") == "left":
                 padded = torch.cat((torch.zeros((max_len - cur_len, cur_new_embed.shape[1]), dtype=cur_new_embed.dtype, device=cur_new_embed.device), cur_new_embed), dim=0)
                 new_input_embeds_padded.append(padded)
@@ -1340,7 +1352,8 @@ class LlavaMetaForCausalLM(ABC):
                 new_input_embeds_padded.append(padded)
                 # Debug: check grad after padding (unconditional)
                 if self.training and i == 0:
-                    print(f"[DEBUG] after padding: cur_new_embed.requires_grad={getattr(cur_new_embed, 'requires_grad', False)}, padded.requires_grad={padded.requires_grad}")
+                    if _DEBUG_GRAD:
+                        print(f"[DEBUG] after padding: cur_new_embed.requires_grad={getattr(cur_new_embed, 'requires_grad', False)}, padded.requires_grad={padded.requires_grad}")
                 if cur_len > 0:
                     new_labels_padded[i, :cur_len] = cur_new_labels
                     attention_mask[i, :cur_len] = True
@@ -1349,7 +1362,8 @@ class LlavaMetaForCausalLM(ABC):
         new_input_embeds = torch.stack(new_input_embeds_padded, dim=0)
         # Debug: check grad after stack (unconditional)
         if self.training and new_input_embeds_padded:
-            print(f"[DEBUG] after stack: new_input_embeds.requires_grad={getattr(new_input_embeds, 'requires_grad', False)}")
+            if _DEBUG_GRAD:
+                print(f"[DEBUG] after stack: new_input_embeds.requires_grad={getattr(new_input_embeds, 'requires_grad', False)}")
         # Debug: if image features had grad, stacked inputs_embeds should too (find where graph is lost)
         if self.training and image_features and any(getattr(t, "requires_grad", False) for t in image_features):
             assert new_input_embeds.requires_grad, "prepare_inputs_labels: inputs_embeds should require_grad when image features did"
