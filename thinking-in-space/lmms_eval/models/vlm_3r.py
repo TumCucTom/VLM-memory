@@ -84,7 +84,7 @@ class Vlm3r(lmms):
         model_base: str = None,
         use_dual_memory: bool = True,
         checkpoint_adapter: str = None,  # optional: load base+LoRA then overlay adapter from this path (for pipeline verification)
-        overlay_memory_only: bool = False,  # if True, only overlay working/episodic memory weights so base+LoRA (~60%%) stays intact; use for untrained-memory baseline
+        overlay_memory_only: bool = False,  # if True, only overlay working/episodic memory weights (fusion_block etc. are frozen in training so should match base; use as safeguard if eval load path differs)
         **kwargs,
     ) -> None:
         super().__init__()
@@ -233,7 +233,7 @@ class Vlm3r(lmms):
             )
             _adapter_prefixes = _memory_only_prefixes if overlay_memory_only else _all_prefixes
             if overlay_memory_only:
-                eval_logger.info("Overlaying only memory weights from checkpoint (base+LoRA preserved for ~60%% baseline)")
+                eval_logger.info("Overlaying only memory weights from checkpoint (fusion_block etc. left from pretrained)")
             # 1) Overlay from safetensors (LoRA shards; may also contain extra state_dict if saved that way)
             index_path = os.path.join(checkpoint_adapter, "model.safetensors.index.json")
             if os.path.isfile(index_path):

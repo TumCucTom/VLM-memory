@@ -30,7 +30,7 @@ MEMORY_DROPOUT=0.1
 
 # Training: hyperparams for 8-node (32 GPU) run. Effective batch = num_gpus * batch_size * grad_accum = 32*1*4 = 128.
 NUM_TRAIN_EPOCHS=3
-LEARNING_RATE=1e-3
+LEARNING_RATE=1e-5
 BATCH_SIZE=1
 GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-4}"
 SAVE_TOTAL_LIMIT=3
@@ -38,7 +38,7 @@ SAVE_TOTAL_LIMIT=3
 RESUME_FROM_CHECKPOINT="${RESUME_FROM_CHECKPOINT:-}"
 
 # Data (same layout as phase1 – adjust if your paths differ; slurm can override via DATA_YAML)
-DATA_YAML="${DATA_YAML:-scripts/VLM_3R/vsibench_data.yaml}"
+DATA_YAML="${DATA_YAML:-scripts/VLM_3R/vsibench_data_no_route_plan.yaml}"
 IMAGE_FOLDER="data/vlm_3r_data"
 VIDEO_FOLDER="data/vlm_3r_data"
 
@@ -98,7 +98,7 @@ ACCELERATE_CPU_AFFINITY=0 torchrun \
     --mm_vision_select_layer -2 \
     --mm_use_im_start_end False \
     --mm_use_im_patch_token False \
-    --group_by_modality_length True \
+    --group_by_modality_length False \
     --image_aspect_ratio anyres_max_9 \
     --image_grid_pinpoints "(1x1),...,(6x6)" \
     --mm_patch_merge_type spatial_unpad \
@@ -112,12 +112,13 @@ ACCELERATE_CPU_AFFINITY=0 torchrun \
     --gradient_accumulation_steps ${GRADIENT_ACCUMULATION_STEPS} \
     --evaluation_strategy "no" \
     --save_strategy "steps" \
-    --save_steps 1 \
+    --save_steps 100 \
     --save_total_limit ${SAVE_TOTAL_LIMIT} \
     --learning_rate ${LEARNING_RATE} \
     --weight_decay 0. \
     --warmup_ratio 0.03 \
     --lr_scheduler_type "cosine" \
+    --max_grad_norm 0.3 \
     --logging_steps 1 \
     --tf32 True \
     --model_max_length 32768 \

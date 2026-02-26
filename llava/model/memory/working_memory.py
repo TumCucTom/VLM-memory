@@ -40,7 +40,8 @@ class WorkingMemory(nn.Module):
         """Clear the working memory buffer"""
         if hasattr(self, '_buffer_list'):
             self._buffer_list = []
-        self._buffer_size = torch.tensor(0)
+        # In-place so _buffer_size stays on same device as module (avoids CPU tensor when model is on GPU)
+        self._buffer_size.zero_()
     
     def update(self, H_t: torch.Tensor) -> List[torch.Tensor]:
         """
@@ -83,7 +84,8 @@ class WorkingMemory(nn.Module):
                 if first_unchanged:
                     print(f"[Working Memory DEBUG] FIFO check failed! First element unchanged after update when full.")
         
-        self._buffer_size = torch.tensor(len(buffer))
+        # In-place so _buffer_size stays on same device as module
+        self._buffer_size.fill_(len(buffer))
         return buffer
     
     def to_tensor(self, device: Optional[torch.device] = None) -> torch.Tensor:

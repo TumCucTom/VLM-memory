@@ -1,5 +1,8 @@
 # Full vsibench (scannet + scannetpp + route_plan / ArkitScenes). For training without missing-file errors,
 # use vsibench_data_valid.yaml (samples with missing videos filtered out). Generate: python scripts/VLM_3R/filter_vsibench_valid_paths.py
+#
+# Train without depth (VLM3R spatial tower): no "with_depth: true" on any dataset. Do not add with_depth
+# unless you have vsibench_points/ depth data and want the depth branch.
 datasets:
   - json_path: data/vlm_3r_data/vsibench/merged_qa_scannet_train.json
   - json_path: data/vlm_3r_data/vsibench/merged_qa_scannetpp_train.json

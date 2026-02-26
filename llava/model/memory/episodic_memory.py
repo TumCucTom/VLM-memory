@@ -58,7 +58,8 @@ class EpisodicMemory(nn.Module):
         """Clear the episodic memory buffer"""
         if hasattr(self, '_buffer_list'):
             self._buffer_list = []
-        self._buffer_size = torch.tensor(0)
+        # In-place so _buffer_size stays on same device as module (avoids CPU tensor when model is on GPU)
+        self._buffer_size.zero_()
     
     def _compute_similarity(self, H_t: torch.Tensor, memory_elem: torch.Tensor) -> float:
         """
@@ -189,7 +190,8 @@ class EpisodicMemory(nn.Module):
                 print(f"[Episodic Memory DEBUG] Replacement verification failed! "
                       f"Element at idx {max_sim_idx} unchanged.")
         
-        self._buffer_size = torch.tensor(len(buffer))
+        # In-place so _buffer_size stays on same device as module
+        self._buffer_size.fill_(len(buffer))
         return buffer
     
     def to_tensor(self, device: Optional[torch.device] = None) -> torch.Tensor:
