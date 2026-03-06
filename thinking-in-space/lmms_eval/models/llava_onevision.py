@@ -13,7 +13,11 @@ import torch
 import transformers
 from accelerate import Accelerator, DistributedType, InitProcessGroupKwargs
 from accelerate.state import AcceleratorState
-from decord import VideoReader, cpu
+try:
+    from decord import VideoReader, cpu
+except ImportError:
+    VideoReader = None
+    cpu = None
 from packaging import version
 from tqdm import tqdm
 from transformers import AutoConfig
@@ -86,7 +90,7 @@ class Llava_OneVision(lmms):
         mm_spatial_pool_stride: Optional[int] = 2,
         mm_spatial_pool_mode: Optional[str] = "bilinear",
         token_strategy: Optional[str] = "single",  # could be "single" or "multiple", "multiple" denotes adding multiple <image> tokens for each frame
-        video_decode_backend: str = "decord",
+        video_decode_backend: str = "pyav",
         **kwargs,
     ) -> None:
         super().__init__()

@@ -8,7 +8,11 @@ import numpy as np
 import torch
 from accelerate import Accelerator, DistributedType, InitProcessGroupKwargs
 from accelerate.state import AcceleratorState
-from decord import VideoReader, cpu
+try:
+    from decord import VideoReader, cpu
+except ImportError:
+    VideoReader = None
+    cpu = None
 from loguru import logger as eval_logger
 from tqdm import tqdm
 from transformers import AutoConfig
