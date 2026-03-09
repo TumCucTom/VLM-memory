@@ -27,9 +27,9 @@ accelerate launch \
     "${LAUNCH_ARGS[@]}" \
     -m lmms_eval \
     --model vlm_3r \
-    --model_args pretrained=Journey9ni/vlm-3r-llava-qwen2-lora,model_base=lmms-lab/LLaVA-NeXT-Video-7B-Qwen2,conv_template=qwen_1_5,max_frames_num=32,use_dual_memory=True,memory_mode=working_only,memory_alpha=0.3 \
+    --model_args pretrained=Journey9ni/vlm-3r-llava-qwen2-lora,model_base=lmms-lab/LLaVA-NeXT-Video-7B-Qwen2,conv_template=qwen_1_5,max_frames_num=32,use_dual_memory=True,memory_mode=working_only,memory_alpha=0.5 \
     --tasks vsibench \
     --batch_size 1 \
     --log_samples \
-    --log_samples_suffix vlm_3r_7b_qwen2_lora \
+    --log_samples_suffix vlm_3r_7b_qwen2_lora_50pct \
     --output_path logs/$(TZ="America/New_York" date "+%Y%m%d")/vsibench

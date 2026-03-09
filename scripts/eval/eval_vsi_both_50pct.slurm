@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=eval_vsibench
-#SBATCH --output=logs/eval/vsibench_%j.out
-#SBATCH --error=logs/eval/vsibench_%j.err
+#SBATCH --job-name=eval_vsi_both_50pct
+#SBATCH --output=logs/eval/vsi_both_50pct_%j.out
+#SBATCH --error=logs/eval/vsi_both_50pct_%j.err
 #SBATCH --time=4:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -53,7 +53,7 @@ export TOKENIZERS_PARALLELISM=false
 export LMMS_EVAL_LAUNCHER="accelerate"
 export NUM_GPUS=${SLURM_GPUS_ON_NODE:-4}
 
-bash eval_vlm_3r_vsibench_70pct.sh
+bash eval_vsi_both_50pct.sh
 
 echo "End Time: $(date)"
 echo "Job completed"

@@ -1,8 +1,8 @@
 #!/bin/bash
-#SBATCH --job-name=eval_vsibench
-#SBATCH --output=logs/eval/vsibench_%j.out
-#SBATCH --error=logs/eval/vsibench_%j.err
-#SBATCH --time=4:00:00
+#SBATCH --job-name=eval_vsti_both_50pct
+#SBATCH --output=logs/eval/vsti_both_50pct_%j.out
+#SBATCH --error=logs/eval/vsti_both_50pct_%j.err
+#SBATCH --time=12:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
@@ -38,7 +38,6 @@ conda activate vsibench
 echo "Python: $(python --version)"
 echo "PyTorch: $(python -c 'import torch; print(torch.__version__)')"
 echo "CUDA available: $(python -c 'import torch; print(torch.cuda.is_available())')"
-echo "Numpy, Scipy versions: $(python -c "import numpy; import scipy; print('numpy', numpy.__version__, 'scipy', scipy.__version__)")"
 
 PROJECT_DIR="${PROJECT_DIR:-$HOME/scratch/VLM-memory}"
 cd "$PROJECT_DIR"
@@ -48,12 +47,11 @@ cd thinking-in-space
 mkdir -p logs
 
 export PYTHONWARNINGS=ignore
-export LLAVA_DEBUG_GRAD=1
 export TOKENIZERS_PARALLELISM=false
 export LMMS_EVAL_LAUNCHER="accelerate"
 export NUM_GPUS=${SLURM_GPUS_ON_NODE:-4}
 
-bash eval_vlm_3r_vsibench_70pct.sh
+bash eval_vsti_both_50pct.sh
 
 echo "End Time: $(date)"
 echo "Job completed"

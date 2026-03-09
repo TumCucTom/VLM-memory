@@ -6,7 +6,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
-#SBATCH --mem=128G
+#SBATCH --mem=400G
 #SBATCH --gres=gpu:4
 #SBATCH --partition=workq
 
@@ -33,7 +33,7 @@ echo "Start Time: $(date)"
 echo "Working Directory: $(pwd)"
 
 source ~/miniforge3/bin/activate
-conda activate vlm3r
+conda activate vsibench
 
 echo "Python: $(python --version)"
 echo "PyTorch: $(python -c 'import torch; print(torch.__version__)')"

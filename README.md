@@ -290,7 +290,7 @@ cd thinking-in-space # Ensure you are in the correct directory if it's a submodu
 conda create --name vsibench python=3.10 -y
 conda activate vsibench
 pip install --upgrade pip
-pip install torch==2.1.1 torchvision==0.16.1 torchaudio==2.1.1 --index-url https://download.pytorch.org/whl/cu121
+pip install torch==2.1.1 torchvision==0.16.1 torchaudio==2.1.1 --extra-index-url https://download.pytorch.org/whl/cu121
 
 pip install -e .
 pip install s2wrapper@git+https://github.com/bfshi/scaling_on_scales

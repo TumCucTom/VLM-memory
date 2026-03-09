@@ -8,6 +8,10 @@ import torch
 import torch.nn as nn
 from typing import List, Optional
 
+# Buffer names
+_buffer_size = "buffer_size"
+_buffer_list = "buffer_list"
+
 
 class EpisodicMemory(nn.Module):
     """
@@ -37,15 +41,15 @@ class EpisodicMemory(nn.Module):
     def get_buffer(self) -> List[torch.Tensor]:
         """Get current episodic memory buffer"""
         if not hasattr(self, _buffer_list):
-            self._buffer_list = []
-        return self._buffer_list
+            setattr(self, _buffer_list, [])
+        return getattr(self, _buffer_list)
     
     def clear(self):
         """Clear the episodic memory buffer"""
         if hasattr(self, _buffer_list):
-            self._buffer_list = []
+            setattr(self, _buffer_list, [])
         # In-place so _buffer_size stays on same device as module (avoids CPU tensor when model is on GPU)
-        self._buffer_size.zero_()
+        getattr(self, _buffer_size).zero_()
     
     def _compute_similarity(self, H_t: torch.Tensor, memory_elem: torch.Tensor) -> float:
         """
@@ -114,7 +118,7 @@ class EpisodicMemory(nn.Module):
             buffer[max_sim_idx] = H_t_storage
         
         # In-place so _buffer_size stays on same device as module
-        self._buffer_size.fill_(len(buffer))
+        getattr(self, _buffer_size).fill_(len(buffer))
         return buffer
     
     def to_tensor(self, device: Optional[torch.device] = None) -> torch.Tensor:

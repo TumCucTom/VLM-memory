@@ -22,7 +22,7 @@ from lmms_eval.api.model import lmms
 from lmms_eval.api.registry import register_model
 from lmms_eval.models.model_utils.load_video import read_video_pyav
 
-import sys; sys.path = ["../../VLM-3R/"] + sys.path
+import sys; sys.path = ["../../VLM-memory/"] + sys.path
 try:
     from llava.constants import (
         DEFAULT_IM_END_TOKEN,
@@ -87,6 +87,8 @@ class Vlm3r(lmms):
         model_name: str = None,
         model_base: str = None,
         use_dual_memory: bool = True,
+        memory_mode: str = "working_only",  # "working_only", "episodic_only", "both", or "off"
+        memory_alpha: float = 0.3,  # fraction of output that comes from memory (0.3 = 30% memory, 70% original)
         checkpoint_adapter: str = None,  # optional: load base+LoRA then overlay adapter from this path (for pipeline verification)
         overlay_memory_only: bool = False,  # if True, only overlay working/episodic memory weights (fusion_block etc. are frozen in training so should match base; use as safeguard if eval load path differs)
         **kwargs,
@@ -147,6 +149,8 @@ class Vlm3r(lmms):
             overwrite_config["add_faster_video"] = False
             overwrite_config["delay_load"] = self.delay_load
             overwrite_config["use_dual_memory"] = use_dual_memory
+            overwrite_config["memory_mode"] = memory_mode
+            overwrite_config["memory_alpha"] = memory_alpha
             # overwrite_config["attn_implementation"] = attn_implementation
 
             # When using checkpoint_adapter, merge memory config from checkpoint so model is built with memory modules (good base + overlay).
