@@ -1,0 +1,56 @@
+#!/bin/bash
+#SBATCH --job-name=train_vlm3r
+#SBATCH --output=logs/train/vlm3r_%j.out
+#SBATCH --error=logs/train/vlm3r_%j.err
+#SBATCH --time=24:00:00
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=32
+#SBATCH --mem=400G
+#SBATCH --gres=gpu:8
+#SBATCH --partition=workq
+
+# Load CUDA (cuda/12.6 and cuda/11.8 available; need toolkit with headers for Triton JIT)
+module load cuda/12.6 2>/dev/null || module load cuda/11.8 2>/dev/null || true
+export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
+if [ ! -f "${CUDA_HOME}/include/cuda.h" ]; then
+  for d in /opt/cray/pe/cuda/12.6 /opt/cray/pe/cuda/11.8 /opt/cuda /usr/local/cuda; do
+    [ -f "${d}/include/cuda.h" ] && export CUDA_HOME="$d" && break
+  done
+fi
+export LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:${CUDA_HOME}/lib64" 2>/dev/null || true
+if [ -f "${CUDA_HOME}/include/cuda.h" ]; then
+  export CPATH="${CUDA_HOME}/include:${CPATH}"
+  export C_INCLUDE_PATH="${CUDA_HOME}/include:${C_INCLUDE_PATH}"
+  export LIBRARY_PATH="${CUDA_HOME}/lib64:${LIBRARY_PATH}"
+fi
+echo "CUDA_HOME: ${CUDA_HOME:-<unset>}"
+
+echo "Job ID: $SLURM_JOB_ID"
+echo "Job Name: $SLURM_JOB_NAME"
+echo "Node: $SLURM_NODELIST"
+echo "Start Time: $(date)"
+echo "Working Directory: $(pwd)"
+
+source ~/miniforge3/bin/activate
+conda activate vsibench
+
+echo "Python: $(python --version)"
+echo "PyTorch: $(python -c 'import torch; print(torch.__version__)')"
+echo "CUDA available: $(python -c 'import torch; print(torch.cuda.is_available())')"
+echo "Numpy, Scipy versions: $(python -c "import numpy; import scipy; print('numpy', numpy.__version__, 'scipy', scipy.__version__)")"
+
+PROJECT_DIR="${PROJECT_DIR:-$HOME/scratch/VLM-memory}"
+cd "$PROJECT_DIR"
+mkdir -p logs/train
+
+export PYTHONWARNINGS=ignore
+
+# Set NUM_GPUS_PER_NODE to the number of GPUs allocated
+export NUM_GPUS_PER_NODE=${SLURM_GPUS_ON_NODE:-8}
+
+# Run the training script
+bash scripts/VLM_3R/train_vsibench.sh
+
+echo "End Time: $(date)"
+echo "Training completed"

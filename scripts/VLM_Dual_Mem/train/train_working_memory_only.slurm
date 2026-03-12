@@ -3,8 +3,8 @@
 #SBATCH --output=logs/train/working_memory_only_%j.out
 #SBATCH --error=logs/train/working_memory_only_%j.err
 #SBATCH --time=3:00:00
-#SBATCH --nodes=4
-#SBATCH --ntasks=4
+#SBATCH --nodes=2
+#SBATCH --ntasks=2
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=400G

@@ -122,4 +122,3 @@ class WorkingMemory(nn.Module):
     def is_full(self) -> bool:
         """Check if working memory is at capacity"""
         return len(self.get_buffer()) >= self.L_w
-
