@@ -108,6 +108,15 @@ if [ -d "${SCANS_DIR}/scans" ]; then
             echo "  Note: Some files/directories remain in nested scans directory"
         fi
     fi
+
+    # Also remove the scans dir itself if it still exists (it's not a scene)
+    # Remove any leftover nested 'scans' or '_scans_legacy' dirs to avoid glob picking them up
+    if [ -d "${SCANS_DIR}/scans" ]; then
+        rm -rf "${SCANS_DIR}/scans" && echo "  Removed leftover nested scans directory"
+    fi
+    if [ -d "${SCANS_DIR}/_scans_legacy" ]; then
+        rm -rf "${SCANS_DIR}/_scans_legacy" && echo "  Removed leftover _scans_legacy directory"
+    fi
     
     if [ $MOVED -gt 0 ]; then
         echo "✓ Moved $MOVED scene directories/files from nested location"

@@ -6,7 +6,7 @@
 # Prefer 'python' (from venv) over 'python3' (system)
 PYTHON_CMD="${PYTHON_CMD:-$(command -v python || command -v python3)}"
 
-SCENES_FILE="data/vlm_3r_data/vsibench/scannet_scenes.txt"
+SCENES_FILE="vlm_3r_data_process/splits/scannet/scannetv2_train.txt"
 DOWNLOAD_DIR="data/vlm_3r_data/scannet/scans"
 VIDEO_OUTPUT_DIR="data/vlm_3r_data/scannet/videos"
 DOWNLOAD_SCRIPT="scripts/VLM_Dual_Mem/data-download/scannet/download-scannet.py"

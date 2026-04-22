@@ -3,8 +3,8 @@
 #SBATCH --output=logs/train/working_memory_only_%j.out
 #SBATCH --error=logs/train/working_memory_only_%j.err
 #SBATCH --time=3:00:00
-#SBATCH --nodes=2
-#SBATCH --ntasks=2
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=400G
@@ -27,6 +27,10 @@ if [ -f "${CUDA_HOME}/include/cuda.h" ]; then
 fi
 # PyTorch/DeepSpeed JIT builds need GCC 9+
 module load gcc/11 2>/dev/null || module load gcc/10 2>/dev/null || module load gcc/9 2>/dev/null || true
+# Force PTX JIT so pre-compiled SASS kernels aren't needed — JIT compiles PTX to SASS for sm_90 at runtime
+export CUDA_FORCE_PTX_JIT=1
+# Explicitly include GH200 sm_90 architecture for any runtime CUDA extension builds
+export TORCH_CUDA_ARCH_LIST="9.0+PTX"
 
 echo "Job ID: $SLURM_JOB_ID"
 echo "Job Name: $SLURM_JOB_NAME"
@@ -38,12 +42,16 @@ echo "CUDA_HOME: ${CUDA_HOME:-<unset>}"
 echo "GCC: $(gcc --version 2>/dev/null | head -1 || echo 'default')"
 
 source ~/miniforge3/bin/activate
-conda activate vlm3r
+conda activate vlm3rtest2
 
 echo "Python: $(python --version)"
 echo "PyTorch: $(python -c 'import torch; print(torch.__version__)')"
 echo "CUDA available: $(python -c 'import torch; print(torch.cuda.is_available())')"
 echo "CUDA devices: $(python -c 'import torch; print(torch.cuda.device_count() if torch.cuda.is_available() else 0)')"
+
+# Clear PT2 compilation cache (might have cached for wrong arch)
+rm -rf ~/.cache/torch_inductor ~/.cache/torch_triton ~/.cache/pytorch
+echo "Cleared PT2 compilation cache"
 
 PROJECT_DIR="${PROJECT_DIR:-$HOME/scratch/VLM-memory}"
 cd "$PROJECT_DIR"

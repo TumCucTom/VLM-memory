@@ -25,14 +25,14 @@ conda activate vlm3r
 mkdir -p logs
 
 # Change to the project root directory
-cd /home/u5fj/trvbale.u5fj/scratch/VLM-memory
+cd /home/b6ar/trvbale.b6ar/scratch/VLM-memory
 
 # Install required packages if not already installed
 echo "Checking dependencies..."
 pip install -q munch tqdm pyyaml || echo "Warning: Some dependencies may not be installed"
 
 # Set the config file path
-CONFIG_FILE="scripts/VLM_Dual_Mem/data-download/scannetpp/download_scannetpp_vlm3r.yml"
+CONFIG_FILE="scripts/VLM_Dual_Mem/data-download/scannetpp/data_download/download_scannetpp.yml"
 WRAPPER_SCRIPT="scripts/VLM_Dual_Mem/data-download/scannetpp/download_scannetpp_wrapper.py"
 
 # Check if config file exists
