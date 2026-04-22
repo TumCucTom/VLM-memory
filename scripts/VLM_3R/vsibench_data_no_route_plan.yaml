@@ -1,6 +1,4 @@
-# Same as vsibench_data.yaml but without route_plan (disables ARKitScenes route-planning data in training).
+# Training with ScanNet data only (no scannet++ or ARKitScenes)
 datasets:
   # scannet
-  - json_path: data/vlm_3r_data/vsibench/merged_qa_scannet_train.json
-  # scannetpp
-  - json_path: data/vlm_3r_data/vsibench/merged_qa_scannetpp_train.json
+  - json_path: data/raw_data/VLM-3R-DATA/vsibench_train/merged_qa_scannet_train.json

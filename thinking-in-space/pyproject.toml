@@ -64,8 +64,7 @@ dependencies = [
     "pre-commit",
     "pydantic",
     "packaging",
-    "decord",
-    "zss",
+        "zss",
     "protobuf==3.20",
 ]
 

@@ -94,10 +94,14 @@ class Vlm3r(lmms):
         **kwargs,
     ) -> None:
         super().__init__()
-        assert kwargs == {}, f"Unexpected kwargs: {kwargs}"
+
+        torch.backends.cudnn.enabled = False
 
         accelerator_kwargs = InitProcessGroupKwargs(timeout=timedelta(weeks=52))
         accelerator = Accelerator(kwargs_handlers=[accelerator_kwargs])
+
+        assert kwargs == {}, f"Unexpected kwargs: {kwargs}"
+
         if accelerator.num_processes > 1:
             self._device = torch.device(f"cuda:{accelerator.local_process_index}")
             self.device_map = f"cuda:{accelerator.local_process_index}"
@@ -151,7 +155,7 @@ class Vlm3r(lmms):
             overwrite_config["use_dual_memory"] = use_dual_memory
             overwrite_config["memory_mode"] = memory_mode
             overwrite_config["memory_alpha"] = memory_alpha
-            # overwrite_config["attn_implementation"] = attn_implementation
+            overwrite_config["attn_implementation"] = attn_implementation
 
             # When using checkpoint_adapter, merge memory config from checkpoint so model is built with memory modules (good base + overlay).
             # Spatial/fusion (spatial_tower, fusion_block, etc.) stay from HF pretrained — just in case.

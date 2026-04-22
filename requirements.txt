@@ -67,7 +67,6 @@ cycler==0.12.1
 datasets==2.16.1
 debugpy==1.8.1
 decorator==5.1.1
-decord==0.6.0
 deepspeed==0.12.2
 defusedxml==0.7.1
 dill==0.3.7

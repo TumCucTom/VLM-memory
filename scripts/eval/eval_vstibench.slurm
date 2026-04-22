@@ -10,22 +10,6 @@
 #SBATCH --gres=gpu:4
 #SBATCH --partition=workq
 
-# Load CUDA (cuda/12.6 and cuda/11.8 available; need toolkit with headers for Triton JIT)
-module load cuda/12.6 2>/dev/null || module load cuda/11.8 2>/dev/null || true
-export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
-if [ ! -f "${CUDA_HOME}/include/cuda.h" ]; then
-  for d in /opt/cray/pe/cuda/12.6 /opt/cray/pe/cuda/11.8 /opt/cuda /usr/local/cuda; do
-    [ -f "${d}/include/cuda.h" ] && export CUDA_HOME="$d" && break
-  done
-fi
-export LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:${CUDA_HOME}/lib64" 2>/dev/null || true
-if [ -f "${CUDA_HOME}/include/cuda.h" ]; then
-  export CPATH="${CUDA_HOME}/include:${CPATH}"
-  export C_INCLUDE_PATH="${CUDA_HOME}/include:${C_INCLUDE_PATH}"
-  export LIBRARY_PATH="${CUDA_HOME}/lib64:${LIBRARY_PATH}"
-fi
-echo "CUDA_HOME: ${CUDA_HOME:-<unset>}"
-
 echo "Job ID: $SLURM_JOB_ID"
 echo "Job Name: $SLURM_JOB_NAME"
 echo "Node: $SLURM_NODELIST"
@@ -33,11 +17,12 @@ echo "Start Time: $(date)"
 echo "Working Directory: $(pwd)"
 
 source ~/miniforge3/bin/activate
-conda activate vsibench
+conda activate pytorch-cu128
 
 echo "Python: $(python --version)"
 echo "PyTorch: $(python -c 'import torch; print(torch.__version__)')"
 echo "CUDA available: $(python -c 'import torch; print(torch.cuda.is_available())')"
+python -c "import torch; print(f'{torch.__version__}, CUDA:{torch.version.cuda}, Available:{torch.cuda.is_available()}, Device:{torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"N/A\"}')"
 
 PROJECT_DIR="${PROJECT_DIR:-$HOME/scratch/VLM-memory}"
 cd "$PROJECT_DIR"
@@ -49,7 +34,7 @@ mkdir -p logs
 export PYTHONWARNINGS=ignore
 export TOKENIZERS_PARALLELISM=false
 export LMMS_EVAL_LAUNCHER="accelerate"
-export NUM_GPUS=${SLURM_GPUS_ON_NODE:-4}
+export NUM_GPUS=${SLURM_JOB_GPUS:-1}
 
 bash eval_vlm_3r_vstibench.sh
 
