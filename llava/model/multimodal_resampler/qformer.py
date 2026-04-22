@@ -36,12 +36,22 @@ from transformers.modeling_outputs import (
     SequenceClassifierOutput,
     TokenClassifierOutput,
 )
-from transformers.modeling_utils import (
-    PreTrainedModel,
-    apply_chunking_to_forward,
-    find_pruneable_heads_and_indices,
-    prune_linear_layer,
-)
+from transformers.modeling_utils import PreTrainedModel
+from transformers.pytorch_utils import apply_chunking_to_forward, prune_linear_layer
+
+
+def find_pruneable_heads_and_indices(heads, num_attention_heads, attention_head_size, already_pruned_heads):
+    """
+    Finds the heads that should be pruned and returns an index tensor of those heads.
+    Based on transformers.modeling_utils.find_pruneable_heads_and_indices from v4.x.
+    """
+    heads = already_pruned_heads.union(heads) if heads is not None else already_pruned_heads
+    indices = []
+    for i in range(num_attention_heads):
+        if i not in heads:
+            indices.extend(range(i * attention_head_size, (i + 1) * attention_head_size))
+    return heads, torch.tensor(indices, dtype=torch.long)
+
 from transformers.utils import logging
 from transformers.models.bert.configuration_bert import BertConfig
 
