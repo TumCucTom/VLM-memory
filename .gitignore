@@ -79,4 +79,4 @@ work_dirs_auto_eval/
 
 .vscode/
 
-.env
+.env._dbindex_/
