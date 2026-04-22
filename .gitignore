@@ -79,4 +79,6 @@ work_dirs_auto_eval/
 
 .vscode/
 
-.env._dbindex_/
+.env
+._dbindex_/
+vlm-3r-llava-qwen2-lora/
