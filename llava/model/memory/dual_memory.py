@@ -1,12 +1,42 @@
 """
 Dual-Memory Module for VLM²
 Implements Algorithm 1: Dual-Memory Module exactly as specified in the paper
+
+Modified to use non-learnable cross-attention and simple 0.5/0.5 fusion
 """
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import Tuple, Optional
 from .working_memory import WorkingMemory
 from .episodic_memory import EpisodicMemory
+
+
+def cross_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    dropout: float = 0.0
+) -> torch.Tensor:
+    """
+    Explicit cross-attention without learnable projections.
+    
+    Args:
+        query: [B, N, D]
+        key: [B, L, D]
+        value: [B, L, D]
+    
+    Returns:
+        output: [B, N, D]
+    """
+    d_k = query.size(-1)
+    scores = torch.matmul(query, key.transpose(-2, -1)) / (d_k ** 0.5)
+    attn_weights = F.softmax(scores, dim=-1)
+    
+    if dropout > 0.0:
+        attn_weights = F.dropout(attn_weights, p=dropout)
+    
+    return torch.matmul(attn_weights, value)
 
 
 class DualMemoryModule(nn.Module):
@@ -15,7 +45,7 @@ class DualMemoryModule(nn.Module):
     
     This module:
     1. Retrieves from working and episodic memories using attention
-    2. Fuses retrieved memories with gated mechanism
+    2. Fuses retrieved memories with simple 0.5/0.5 weighting
     3. Updates both memories according to their update strategies
     """
     
@@ -24,8 +54,7 @@ class DualMemoryModule(nn.Module):
         L_w: int = 8,
         L_e: int = 32,
         feature_dim: int = 1152,
-        num_heads: int = 8,
-        dropout: float = 0.1
+        dropout: float = 0.0
     ):
         """
         Args:
@@ -34,48 +63,17 @@ class DualMemoryModule(nn.Module):
             L_e: Episodic memory capacity
                 Recommended: 32 (from ablation study, Table 7)
             feature_dim: Dimension of input features H_t
-            num_heads: Number of attention heads for retrieval
-                NOTE: Not specified in paper - using default of 8
-            dropout: Dropout rate for attention
-                NOTE: Not specified in paper - using default of 0.1
+            dropout: Dropout rate for attention (default 0 for no dropout)
         """
         super().__init__()
         self.L_w = L_w
         self.L_e = L_e
         self.feature_dim = feature_dim
+        self.dropout = dropout
         
         # Initialize memory modules
         self.working_memory = WorkingMemory(L_w=L_w, feature_dim=feature_dim)
         self.episodic_memory = EpisodicMemory(L_e=L_e, feature_dim=feature_dim)
-        
-        # Attention mechanisms for retrieval (Algorithm 1 Lines 1-2)
-        # Working Attention: Q = H_t, KV = W_t
-        self.working_attention = nn.MultiheadAttention(
-            embed_dim=feature_dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True
-        )
-        
-        # Episodic Attention: Q = H_t, KV = E_t
-        self.episodic_attention = nn.MultiheadAttention(
-            embed_dim=feature_dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True
-        )
-        
-        # Gated fusion MLP (Algorithm 1 Line 5)
-        # γ_t ← MLP([M_t^w; M_t^e])
-        # Input: concatenated M_t^w and M_t^e [2 * feature_dim]
-        # Output: gate value γ_t [feature_dim]
-        self.gate_mlp = nn.Sequential(
-            nn.Linear(2 * feature_dim, feature_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(feature_dim, feature_dim),
-            nn.Sigmoid()  # Gate value between 0 and 1
-        )
     
     def _prepare_for_attention(
         self,
@@ -110,8 +108,6 @@ class DualMemoryModule(nn.Module):
             memory_tensor = torch.zeros(B, 0, self.feature_dim, device=device, dtype=query.dtype)
         else:
             # Stack memory elements
-            # Each element might have different shapes, need to handle this
-            # For now, assume all elements have same shape as query features
             memory_list = []
             for mem_elem in memory_buffer:
                 mem_elem = mem_elem.to(device)
@@ -125,10 +121,9 @@ class DualMemoryModule(nn.Module):
                 
                 # Average pool if needed to match query sequence length
                 if mem_elem.shape[0] != query.shape[1]:
-                    # Use adaptive pooling or mean pooling
                     if mem_elem.shape[0] > query.shape[1]:
                         # Downsample
-                        mem_elem = nn.functional.adaptive_avg_pool1d(
+                        mem_elem = F.adaptive_avg_pool1d(
                             mem_elem.transpose(0, 1).unsqueeze(0),
                             query.shape[1]
                         ).squeeze(0).transpose(0, 1)
@@ -139,10 +134,8 @@ class DualMemoryModule(nn.Module):
                 
                 memory_list.append(mem_elem)
             
-            # Stack: [L, N, D] -> [L, N, D]
             memory_tensor = torch.stack(memory_list, dim=0)  # [L, N, D]
-            # Convert to [B, L, N, D] then reshape to [B, L*N, D] or average
-            # For simplicity, average over sequence dimension: [L, N, D] -> [L, D]
+            # Average over sequence dimension: [L, N, D] -> [L, D]
             if memory_tensor.dim() == 3:
                 memory_tensor = memory_tensor.mean(dim=1)  # [L, D]
             
@@ -180,13 +173,14 @@ class DualMemoryModule(nn.Module):
         if E_t is None:
             E_t = self.episodic_memory.get_buffer()
         
-        # Algorithm 1 Line 1: M_t^w ← Working Attention(Q = H_t, KV = W_t)
+        # Working Memory retrieval: M_t^w = CrossAttn(Q=H_t, KV=W_t)
         if len(W_t) > 0:
             query_w, key_value_w = self._prepare_for_attention(H_t, W_t, device)
-            M_t_w, _ = self.working_attention(
-                query=query_w,
-                key=key_value_w,
-                value=key_value_w
+            M_t_w = cross_attention(
+                query_w,
+                key_value_w,
+                key_value_w,
+                dropout=self.dropout
             )  # [B, N, D]
         else:
             # Empty working memory - use zero tensor
@@ -197,13 +191,14 @@ class DualMemoryModule(nn.Module):
             else:
                 M_t_w = torch.zeros_like(H_t)
         
-        # Algorithm 1 Line 2: M_t^e ← Episodic Attention(Q = H_t, KV = E_t)
+        # Episodic Memory retrieval: M_t^e = CrossAttn(Q=H_t, KV=E_t)
         if len(E_t) > 0:
             query_e, key_value_e = self._prepare_for_attention(H_t, E_t, device)
-            M_t_e, _ = self.episodic_attention(
-                query=query_e,
-                key=key_value_e,
-                value=key_value_e
+            M_t_e = cross_attention(
+                query_e,
+                key_value_e,
+                key_value_e,
+                dropout=self.dropout
             )  # [B, N, D]
         else:
             # Empty episodic memory - use zero tensor
@@ -216,25 +211,20 @@ class DualMemoryModule(nn.Module):
         
         # Ensure M_t_w and M_t_e have same shape
         if M_t_w.shape != M_t_e.shape:
-            # Reshape to match
             target_shape = M_t_w.shape
             if M_t_e.numel() > 0:
-                M_t_e = nn.functional.interpolate(
+                M_t_e = F.interpolate(
                     M_t_e.transpose(1, 2),
                     size=target_shape[1],
-                    mode='linear',
+                    mode=linear,
                     align_corners=False
                 ).transpose(1, 2)
             else:
                 M_t_e = torch.zeros_like(M_t_w)
         
-        # Algorithm 1 Line 5: γ_t ← MLP([M_t^w; M_t^e])
-        # Concatenate along feature dimension
-        concat = torch.cat([M_t_w, M_t_e], dim=-1)  # [B, N, 2*D]
-        gamma_t = self.gate_mlp(concat)  # [B, N, D]
-        
-        # Algorithm 1 Lines 6-7: M_t ← γ_t ⊙ M_t^w + (1-γ_t) ⊙ M_t^e
-        M_t = gamma_t * M_t_w + (1 - gamma_t) * M_t_e  # [B, N, D]
+        # Simple 0.5/0.5 fusion (no learnable gate)
+        # M_t = 0.5 * M_t^w + 0.5 * M_t^e
+        M_t = 0.5 * M_t_w + 0.5 * M_t_e  # [B, N, D]
         
         # Algorithm 1 Lines 8-14: Update Working Memory
         # W_{t+1} ← Update Working Memory with H_t
@@ -242,8 +232,6 @@ class DualMemoryModule(nn.Module):
         
         # Algorithm 1 Lines 15-24: Update Episodic Memory
         # E_{t+1} ← Update Episodic Memory with M_t
-        # Need to extract a single representation from M_t for storage
-        # Use mean pooling over sequence dimension if needed
         if M_t.dim() == 3:
             M_t_for_storage = M_t.mean(dim=1)  # [B, D] -> average over sequence
             if M_t_for_storage.dim() == 2 and M_t_for_storage.shape[0] == 1:

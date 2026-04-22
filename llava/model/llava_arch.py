@@ -21,6 +21,7 @@ import re
 import time
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from .multimodal_encoder.builder import build_vision_tower
 from .multimodal_spatial_encoder.builder import build_spatial_tower
 from .multimodal_fusion_block.builder import build_multimodal_fusion_block
@@ -28,6 +29,36 @@ from .multimodal_resampler.builder import build_vision_resampler
 from .multimodal_projector.builder import build_vision_projector
 from .memory.working_memory import WorkingMemory
 from .memory.episodic_memory import EpisodicMemory
+
+
+def plain_cross_attention(query, key, value):
+    """
+    Plain cross-attention without learnable weights.
+    Uses cosine similarity for stable attention weights.
+    
+    Args:
+        query: [B, N, D]
+        key: [B, M, D] 
+        value: [B, M, D]
+    
+    Returns:
+        output: [B, N, D]
+    """
+    # Normalize for cosine similarity (L2 normalized vectors)
+    # This ensures dot products are in [-1, 1] range
+    query_norm = F.normalize(query, p=2, dim=-1)  # [B, N, D]
+    key_norm = F.normalize(key, p=2, dim=-1)      # [B, M, D]
+    
+    # Cosine similarity as attention logits (no scaling needed)
+    scores = torch.matmul(query_norm, key_norm.transpose(-2, -1))  # [B, N, M]
+    
+    # Softmax over memory dimension
+    attn_weights = F.softmax(scores, dim=-1)  # [B, N, M]
+    
+    # Weighted sum of values
+    output = torch.matmul(attn_weights, value)  # [B, N, D]
+    
+    return output, attn_weights
 from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 
 from llava.mm_utils import get_anyres_image_grid_shape
@@ -75,35 +106,11 @@ class LlavaMetaModel:
             use_gated_attention = getattr(config, "episodic_memory_gated_attention", True)
             self.episodic_memory = EpisodicMemory(
                 L_e=episodic_memory_size,
-                feature_dim=config.hidden_size,
-                use_gated_attention=use_gated_attention
+                feature_dim=config.hidden_size
             )
-            # Attention mechanism for working memory retrieval (Algorithm 1 Line 1)
-            # Working Attention: Q = H_t, KV = W_t
-            num_heads = getattr(config, "num_attention_heads", 8)
-            self.working_attention = nn.MultiheadAttention(
-                embed_dim=config.hidden_size,
-                num_heads=num_heads,
-                dropout=0.1,
-                batch_first=True
-            )
-            # Attention mechanism for episodic memory retrieval (Algorithm 1 Line 2)
-            # Episodic Attention: Q = H_t, KV = E_t
-            self.episodic_attention = nn.MultiheadAttention(
-                embed_dim=config.hidden_size,
-                num_heads=num_heads,
-                dropout=0.1,
-                batch_first=True
-            )
-            # Fusion MLP for combining working and episodic memory (Algorithm 1 Lines 5-7)
-            # γ_t ← MLP([M_t^w; M_t^e])
-            fusion_hidden_dim = getattr(config, "memory_fusion_hidden_dim", config.hidden_size)
-            self.memory_fusion_mlp = nn.Sequential(
-                nn.Linear(config.hidden_size * 2, fusion_hidden_dim),  # [M_t^w; M_t^e] -> hidden
-                nn.ReLU(),
-                nn.Linear(fusion_hidden_dim, config.hidden_size),  # hidden -> feature_dim
-                nn.Sigmoid()  # Output gate values in [0, 1]
-            )
+            # NOTE: We use plain cross-attention without learnable weights (no training needed)
+            # The attention computation itself is just: softmax(Q @ K^T / sqrt(d)) @ V
+            # No nn.MultiheadAttention or learned projections required
 
             if "unpad" in getattr(config, "mm_patch_merge_type", ""):
                 self.image_newline = nn.Parameter(torch.empty(config.hidden_size, dtype=self.dtype))
@@ -171,9 +178,18 @@ class LlavaMetaModel:
         
         # Get memory mode from config (default: "working_only")
         memory_mode = getattr(self.config, 'memory_mode', 'working_only').lower()
+        memory_alpha = getattr(self.config, 'memory_alpha', 0.3)  # fraction from memory
         use_working = memory_mode in ['working_only', 'both']
         use_episodic = memory_mode in ['episodic_only', 'both']
         use_fusion = memory_mode == 'both'
+        
+        # DEBUG: Log entry to _apply_dual_memory
+        if _DEBUG_GRAD:
+            w_len = len(working_memory) if working_memory is not None else 0
+            e_len = len(episodic_memory) if episodic_memory is not None else 0
+            rank0_print(f"[DEBUG] _apply_dual_memory called: H_t shape={H_t.shape}, memory_mode={memory_mode}, "
+                      f"memory_alpha={memory_alpha}, use_working={use_working}, use_episodic={use_episodic}, use_fusion={use_fusion}, "
+                      f"working_mem_len={w_len}, episodic_mem_len={e_len}")
         
         # If no memory modules or mode doesn't match available memories, return original features
         if (working_memory is None and use_working) or (episodic_memory is None and use_episodic):
@@ -218,8 +234,8 @@ class LlavaMetaModel:
                         # DEBUG: Verify attention retrieval is happening
                         H_t_frame_mean = H_t_frame.mean().item()
                         
-                        # Working Attention
-                        M_t_w_frame, attn_weights_w = self.working_attention(
+                        # Working Attention (plain, no learnable weights)
+                        M_t_w_frame, attn_weights_w = plain_cross_attention(
                             query=query,  # [1, N, D]
                             key=W_t_tensor,  # [1, L_w, D]
                             value=W_t_tensor  # [1, L_w, D]
@@ -240,14 +256,10 @@ class LlavaMetaModel:
                             rank0_print(f"[WARNING] Frame {frame_idx}: Working attention output identical to input! "
                                       f"diff_norm={diff_norm:.6f}")
                     else:
-                        # Buffer empty (e.g. first frame or single image): still pass through working_attention
-                        # so the loss has a grad path to trainable params (fixes "does not require grad" backward error).
+                        # Buffer empty (e.g. first frame or single image): use identity (no retrieval needed)
                         if _DEBUG_GRAD and frame_idx == 0:
-                            rank0_print(f"[Dual Memory] Frame {frame_idx}: Working memory empty (first frame), passing through working_attention for grad path")
-                        M_t_w_frame, _ = self.working_attention(
-                            query=query, key=query, value=query
-                        )
-                        M_t_w_frame = M_t_w_frame.squeeze(0)  # [N, D]
+                            rank0_print(f"[Dual Memory] Frame {frame_idx}: Working memory empty (first frame), using identity")
+                        M_t_w_frame = query.squeeze(0)  # [N, D]
                 else:
                     M_t_w_frame = H_t_frame
                 
@@ -266,8 +278,8 @@ class LlavaMetaModel:
                         # DEBUG: Verify attention retrieval is happening
                         H_t_frame_mean_before = H_t_frame.mean().item()
                         
-                        # Episodic Attention
-                        M_t_e_frame, attn_weights_e = self.episodic_attention(
+                        # Episodic Attention (plain, no learnable weights)
+                        M_t_e_frame, attn_weights_e = plain_cross_attention(
                             query=query,  # [1, N, D]
                             key=E_t_tensor,  # [1, L_e, D]
                             value=E_t_tensor  # [1, L_e, D]
@@ -288,49 +300,31 @@ class LlavaMetaModel:
                             rank0_print(f"[WARNING] Frame {frame_idx}: Episodic attention output identical to input! "
                                       f"diff_norm={diff_norm:.6f}")
                     else:
-                        # Buffer empty: pass through episodic_attention so loss has grad path to trainable params.
+                        # Buffer empty: use identity (no retrieval needed)
                         if _DEBUG_GRAD and frame_idx == 0:
-                            rank0_print(f"[Dual Memory] Frame {frame_idx}: Episodic memory empty (first frame), passing through episodic_attention for grad path")
-                        M_t_e_frame, _ = self.episodic_attention(
-                            query=query, key=query, value=query
-                        )
-                        M_t_e_frame = M_t_e_frame.squeeze(0)  # [N, D]
+                            rank0_print(f"[Dual Memory] Frame {frame_idx}: Episodic memory empty (first frame), using identity")
+                        M_t_e_frame = query.squeeze(0)  # [N, D]
                 else:
                     M_t_e_frame = H_t_frame
                 
-                # Algorithm 1 Lines 5-7: Gated Memory Fusion (only if both memories are used)
-                # γ_t = σ(MLP(Concat[M_t^w; M_t^e]))
-                # M_t = γ_t ⊙ M_t^w + (1-γ_t) ⊙ M_t^e
+                # Algorithm 1 Lines 5-7: Simple average fusion (no training needed)
+                # M_t = 0.5 * M_t^w + 0.5 * M_t^e
+                # Use residual connection to preserve original features when using memory
+                # memory_alpha is read from config at function entry
+                
                 if use_fusion:
-                    # Concatenate along feature dimension: [N, D] + [N, D] -> [N, 2*D]
-                    M_concat = torch.cat([M_t_w_frame, M_t_e_frame], dim=-1)  # [N, 2*D]
+                    # Fusion mode: blend fused memory with original using memory_alpha
+                    M_t_fused = 0.5 * M_t_w_frame + 0.5 * M_t_e_frame
+                    M_t_frame = (1 - memory_alpha) * H_t_frame + memory_alpha * M_t_fused
                     
-                    # Compute gate: [N, 2*D] -> [N, D]
-                    gamma_t = self.memory_fusion_mlp(M_concat)  # [N, D]
-                    
-                    # DEBUG: Verify gate values are in [0, 1] and vary
-                    gamma_min = gamma_t.min().item()
-                    gamma_max = gamma_t.max().item()
-                    gamma_mean = gamma_t.mean().item()
-                    gamma_std = gamma_t.std().item()
                     if _DEBUG_GRAD and (frame_idx < 3 or frame_idx % 10 == 0):
-                        rank0_print(f"[DEBUG] Frame {frame_idx}: Memory fusion gate γ_t - "
-                                  f"min: {gamma_min:.4f}, max: {gamma_max:.4f}, "
-                                  f"mean: {gamma_mean:.4f}, std: {gamma_std:.4f}")
-                    
-                    # Verify gate is in valid range [0, 1]
-                    if gamma_min < -0.01 or gamma_max > 1.01:
-                        rank0_print(f"[WARNING] Frame {frame_idx}: Gate values out of [0,1] range! "
-                                  f"min: {gamma_min:.4f}, max: {gamma_max:.4f}")
-                    
-                    # Fused output (Algorithm 1 Line 7): [N, D]
-                    M_t_frame = gamma_t * M_t_w_frame + (1 - gamma_t) * M_t_e_frame
+                        rank0_print(f"[DEBUG] Frame {frame_idx}: Memory fusion with alpha={memory_alpha}")
                 elif use_working:
-                    # Working memory only: use M_t_w directly
-                    M_t_frame = M_t_w_frame
+                    # Working memory only: blend with original to preserve baseline
+                    M_t_frame = (1 - memory_alpha) * H_t_frame + memory_alpha * M_t_w_frame
                 elif use_episodic:
-                    # Episodic memory only: use M_t_e directly
-                    M_t_frame = M_t_e_frame
+                    # Episodic memory only: blend with original to preserve baseline
+                    M_t_frame = (1 - memory_alpha) * H_t_frame + memory_alpha * M_t_e_frame
                 else:
                     # Fallback: should not happen, but use H_t
                     M_t_frame = H_t_frame
@@ -454,15 +448,18 @@ class LlavaMetaModel:
             if use_working and working_memory is not None:
                 W_t = working_memory.get_buffer()
                 if len(W_t) > 0:
-                    memory_list = [mem_elem.to(device).flatten() if mem_elem.dim() > 1 else mem_elem.to(device) 
-                                  for mem_elem in W_t]
-                    W_t_tensor = torch.stack(memory_list, dim=0).unsqueeze(0)  # [1, L_w, D]
-                    M_t_w, _ = self.working_attention(query=query, key=W_t_tensor, value=W_t_tensor)
+                    # Match video processing path: concat along sequence dimension, not flatten
+                    memory_list = [mem_elem.to(device) for mem_elem in W_t]
+                    W_t_tensor = torch.cat(memory_list, dim=0).unsqueeze(0)  # [1, L_w*N, D]
+                    # DEBUG: Print shapes
+                    if _DEBUG_GRAD:
+                        rank0_print(f"[DEBUG] Working memory retrieval: query shape={query.shape}, W_t_tensor shape={W_t_tensor.shape}")
+                    # Plain attention (no learnable weights)
+                    M_t_w, _ = plain_cross_attention(query=query, key=W_t_tensor, value=W_t_tensor)
                     M_t_w = M_t_w.squeeze(0) if M_t_w.dim() > H_t.dim() else M_t_w
                 else:
-                    # Buffer empty: pass through working_attention so loss has grad path (fixes backward "does not require grad").
-                    M_t_w, _ = self.working_attention(query=query, key=query, value=query)
-                    M_t_w = M_t_w.squeeze(0) if M_t_w.dim() > H_t.dim() else M_t_w
+                    # Buffer empty: use identity
+                    M_t_w = query.squeeze(0) if query.dim() > H_t.dim() else H_t
             else:
                 M_t_w = H_t
             
@@ -471,38 +468,49 @@ class LlavaMetaModel:
             if use_episodic and episodic_memory is not None:
                 E_t = episodic_memory.get_buffer()
                 if len(E_t) > 0:
-                    memory_list = [mem_elem.to(device).flatten() if mem_elem.dim() > 1 else mem_elem.to(device) 
-                                  for mem_elem in E_t]
-                    E_t_tensor = torch.stack(memory_list, dim=0).unsqueeze(0)  # [1, L_e, D]
-                    M_t_e, _ = self.episodic_attention(query=query, key=E_t_tensor, value=E_t_tensor)
+                    # Match video processing path: concat along sequence dimension, not flatten
+                    memory_list = [mem_elem.to(device) for mem_elem in E_t]
+                    E_t_tensor = torch.cat(memory_list, dim=0).unsqueeze(0)  # [1, L_e*N, D]
+                    # DEBUG: Print shapes
+                    if _DEBUG_GRAD:
+                        rank0_print(f"[DEBUG] Episodic memory retrieval: query shape={query.shape}, E_t_tensor shape={E_t_tensor.shape}")
+                    # Plain attention (no learnable weights)
+                    M_t_e, _ = plain_cross_attention(query=query, key=E_t_tensor, value=E_t_tensor)
                     M_t_e = M_t_e.squeeze(0) if M_t_e.dim() > H_t.dim() else M_t_e
                 else:
-                    # Buffer empty: pass through episodic_attention so loss has grad path.
-                    M_t_e, _ = self.episodic_attention(query=query, key=query, value=query)
-                    M_t_e = M_t_e.squeeze(0) if M_t_e.dim() > H_t.dim() else M_t_e
+                    # Buffer empty: use identity
+                    M_t_e = query.squeeze(0) if query.dim() > H_t.dim() else H_t
             else:
                 M_t_e = H_t
             
-            # Algorithm 1 Lines 5-7: Gated Memory Fusion (only if both memories are used)
-            # γ_t = σ(MLP(Concat[M_t^w; M_t^e]))
-            # M_t = γ_t ⊙ M_t^w + (1-γ_t) ⊙ M_t^e
+            # Algorithm 1 Lines 5-7: Simple average fusion (no training needed)
+            # M_t = 0.5 * M_t^w + 0.5 * M_t^e
+            # Use residual connection to preserve original features when using memory
+            # This prevents performance degradation from complete feature replacement
+            # memory_alpha is read from config at function entry
+            
             if use_fusion:
-                M_concat = torch.cat([M_t_w, M_t_e], dim=-1)
-                gamma_t = self.memory_fusion_mlp(M_concat)
-                M_t = gamma_t * M_t_w + (1 - gamma_t) * M_t_e  # No residual connection per Algorithm 1
+                # Fusion mode: blend fused memory with original using memory_alpha
+                M_t_fused = 0.5 * M_t_w + 0.5 * M_t_e
+                M_t = (1 - memory_alpha) * H_t + memory_alpha * M_t_fused
             elif use_working:
-                # Working memory only: use M_t_w directly
-                M_t = M_t_w
+                # Working memory only: blend with original to preserve baseline performance
+                M_t = (1 - memory_alpha) * H_t + memory_alpha * M_t_w
             elif use_episodic:
-                # Episodic memory only: use M_t_e directly
-                M_t = M_t_e
+                # Episodic memory only: blend with original to preserve baseline performance
+                M_t = (1 - memory_alpha) * H_t + memory_alpha * M_t_e
             else:
                 # Fallback: should not happen, but use H_t
                 M_t = H_t
             
-            # Extract representations for storage
-            H_t_for_storage = H_t.mean(dim=0) if H_t.dim() == 2 else H_t.flatten()  # For working memory
-            M_t_for_storage = M_t.mean(dim=0) if M_t.dim() == 2 else M_t.flatten()  # For episodic memory
+            # Safeguard: if M_t has NaN, fall back to H_t to prevent memory corruption
+            if torch.isnan(M_t).any():
+                rank0_print(f"[WARNING] NaN detected in M_t at frame {frame_idx}, falling back to H_t")
+                M_t = H_t
+            
+            # Extract representations for storage - match video path: use full frame, not mean-pooled
+            H_t_for_storage = H_t  # [N, D] - for working memory (match video path)
+            M_t_for_storage = M_t  # [N, D] - for episodic memory (match video path)
             
             # Algorithm 1 Lines 8-14: Update Working Memory (FIFO) with H_t
             # Only update if working memory is enabled
@@ -513,6 +521,10 @@ class LlavaMetaModel:
             # Only update if episodic memory is enabled
             if use_episodic and episodic_memory is not None:
                 episodic_memory.update(M_t_for_storage)  # Use M_t, not H_t!
+        
+        # DEBUG: Log output
+        if _DEBUG_GRAD:
+            rank0_print(f"[DEBUG] _apply_dual_memory returning: M_t shape={M_t.shape}, mean={M_t.mean().item():.4f}, std={M_t.std().item():.4f}")
         
         return M_t
     
@@ -861,29 +873,8 @@ class LlavaMetaForCausalLM(ABC):
             self.get_model().get_episodic_memory() is not None
         ):
             image_features = self.get_model()._apply_dual_memory(image_features)
-            # Training: ensure loss has grad path to working_attention (frozen vision tower breaks graph otherwise).
-            if self.training and self.get_model().get_working_memory() is not None:
-                wa = self.get_model().working_attention
-                if image_features.dim() == 3:
-                    out_list = []
-                    for i in range(image_features.shape[0]):
-                        q = image_features[i : i + 1]  # [1, N, D]
-                        o, _ = wa(q, q, q)
-                        out_list.append(o.squeeze(0))
-                    safety_out = torch.stack(out_list, dim=0)
-                else:
-                    q = image_features.unsqueeze(0) if image_features.dim() == 2 else image_features
-                    if q.dim() == 2:
-                        q = q.unsqueeze(0)
-                    o, _ = wa(q, q, q)
-                    safety_out = o.squeeze(0)
-                # Force grad path: 0 in forward but carries grad from working_attention in backward.
-                image_features = image_features + (safety_out - safety_out.detach())
-            # Debug: ensure encode path produces grad when training with working memory
-            if self.training and self.get_model().get_working_memory() is not None:
-                if _DEBUG_GRAD:
-                    print(f"[DEBUG] encode_images returning: requires_grad={image_features.requires_grad}, grad_fn={image_features.grad_fn}")
-                assert image_features.requires_grad, "encode_images: output should require_grad when training with working memory"
+            # Note: We now use plain cross-attention without learnable weights, so no grad path hack needed
+            # (This was only needed when using nn.MultiheadAttention which has learnable params)
         return image_features
     
     def encode_multimodals(self, videos_or_images, video_idx_in_batch, split_sizes=None):
