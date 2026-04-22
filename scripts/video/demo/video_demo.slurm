@@ -2,16 +2,13 @@
 #SBATCH --job-name=vlm3r_video_demo
 #SBATCH --output=logs/video_demo_memory_%j.out
 #SBATCH --error=logs/video_demo_memory_%j.err
-#SBATCH --time=04:00:00
+#SBATCH --time=00:10:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
 #SBATCH --gres=gpu:1
 #SBATCH --partition=workq
-
-# Load CUDA module (use 12.6 which is available on this system)
-module load cuda/12.6
 
 # Add CUDA library path for bitsandbytes (CUDA libraries are in targets/sbsa-linux/lib)
 export LD_LIBRARY_PATH=/opt/nvidia/hpc_sdk/Linux_aarch64/24.11/cuda/12.6/targets/sbsa-linux/lib:$LD_LIBRARY_PATH
@@ -32,10 +29,10 @@ echo "LD_LIBRARY_PATH: $LD_LIBRARY_PATH"
 
 # Activate conda environment (which has decord installed)
 source ~/miniforge3/bin/activate
-conda activate vlm3r
+conda activate vlm3r-2
 
 # Change to project directory
-cd /home/u5fj/trvbale.u5fj/scratch/VLM-memory
+cd /home/b6ar/trvbale.b6ar/scratch/VLM-memory
 
 
 # Install llava package in editable mode if not already installed
@@ -68,19 +65,25 @@ export BITSANDBYTES_NOWELCOME=1
 # Point to the actual CUDA library location
 export LD_LIBRARY_PATH=/opt/nvidia/hpc_sdk/Linux_aarch64/24.11/cuda/12.6/targets/sbsa-linux/lib:$LD_LIBRARY_PATH
 
-# Run the exact command from README.md (lines 153-157)
-# Note: $IDX is not set in the shell script, so --chunk-idx will be -1, but we'll fix that
-# by setting IDX=1 to match default behavior
+# Set the prompt for the video demo
+export PROMPT="If I am standing by the stool and facing the stove, is the sofa to my left, right, or back?"
 export IDX=1
 
-# Set the prompt for the video demo
-export PROMPT="If I am standing by the stool and facing the stove, is the sofa to my left, right, or back?\nAn object is to my back if I would have to turn at least 135 degrees in order to face it."
-
-bash scripts/video/demo/video_demo.sh \
-    Journey9ni/vlm-3r-llava-qwen2-lora \
-    qwen_1_5 64 2 average grid True \
-    playground/demo/47334096.mp4 \
-    lmms-lab/LLaVA-NeXT-Video-7B-Qwen2
+python3 playground/demo/video_demo.py \
+    --model-path Journey9ni/vlm-3r-llava-qwen2-lora \
+    --model-base lmms-lab/LLaVA-NeXT-Video-7B-Qwen2 \
+    --video_path playground/demo/47334096.mp4 \
+    --output_dir ./work_dirs/video_demo/vlm-3r-llava-qwen2-lora_qwen_1_5_frames_64_stride_2 \
+    --output_name pred \
+    --chunk-idx $(($IDX - 1)) \
+    --overwrite True \
+    --mm_spatial_pool_stride 2 \
+    --for_get_frames_num 16 \
+    --conv-mode qwen_1_5 \
+    --mm_spatial_pool_mode average \
+    --mm_newline_position grid \
+    --use_av True \
+    --prompt "${PROMPT}. An object is to my back if I would have to turn at least 135 degrees in order to face it."
 
 # Print completion time
 echo "End Time: $(date)"

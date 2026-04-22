@@ -12,6 +12,7 @@ import os
 import math
 from tqdm import tqdm
 from decord import VideoReader, cpu
+import av
 
 from transformers import AutoConfig
 
@@ -65,14 +66,20 @@ def parse_args():
     parser.add_argument("--mm_newline_position", type=str, default="no_token")
     parser.add_argument("--force_sample", type=lambda x: (str(x).lower() == 'true'), default=False)
     parser.add_argument("--add_time_instruction", type=str, default=False)
+    parser.add_argument("--use_av", type=lambda x: (str(x).lower() == 'true'), default=False,
+                        help="Use PyAV instead of decord for video loading")
+    parser.add_argument("--temperature", type=float, default=0.0,
+                        help="Temperature for generation (0 = greedy, >0 = sampling)")
     parser.add_argument("--disable_salience_gate", type=lambda x: (str(x).lower() == 'true'), default=False,
                         help="Disable salience gate in episodic memory (store all frames)")
     return parser.parse_args()
 
-def load_video(video_path,args):
+def load_video(video_path, args):
+    if args.use_av:
+        return load_video_av(video_path, args)
     if args.for_get_frames_num == 0:
         return np.zeros((1, 336, 336, 3))
-    vr = VideoReader(video_path, ctx=cpu(0),num_threads=1)
+    vr = VideoReader(video_path, ctx=cpu(0), num_threads=1)
     total_frame_num = len(vr)
     video_time = total_frame_num / vr.get_avg_fps()
     fps = round(vr.get_avg_fps())
@@ -90,6 +97,38 @@ def load_video(video_path,args):
     return spare_frames,frame_time,video_time
 
 
+def load_video_av(video_path, args):
+    if args.for_get_frames_num == 0:
+        return np.zeros((1, 336, 336, 3))
+    container = av.open(video_path)
+    stream = container.streams.video[0]
+    total_frame_num = stream.frames
+    if total_frame_num == 0:
+        total_frame_num = int(container.duration / av.time_base * stream.average_rate)
+    video_time = total_frame_num / float(stream.average_rate) if stream.average_rate else 0
+    fps = round(float(stream.average_rate))
+    frame_idx = [i for i in range(0, total_frame_num, fps)]
+    frame_time = [i / float(stream.average_rate) for i in frame_idx]
+    if len(frame_idx) > args.for_get_frames_num or args.force_sample:
+        sample_fps = args.for_get_frames_num
+        uniform_sampled_frames = np.linspace(0, total_frame_num - 1, sample_fps, dtype=int)
+        frame_idx = uniform_sampled_frames.tolist()
+        frame_time = [i / float(stream.average_rate) for i in frame_idx]
+    frame_time_str = ",".join([f"{i:.2f}s" for i in frame_time])
+    spare_frames = []
+    stream.thread_type = av.codec.context.ThreadType.NONE
+    for target_idx in sorted(frame_idx):
+        container.seek(0)
+        frames_decoded = 0
+        for frame in container.decode(video=0):
+            if frames_decoded < target_idx:
+                frames_decoded += 1
+                continue
+            frame = frame.to_ndarray(format="rgb24")
+            spare_frames.append(frame)
+            break
+    spare_frames = np.array(spare_frames)
+    return spare_frames, frame_time_str, video_time
 
 
 def load_video_base64(path):
@@ -270,11 +309,10 @@ def run_inference(args):
                 # import pdb;pdb.set_trace()
                 # output_ids = model.generate(inputs=input_ids, images=video, attention_mask=attention_masks, modalities="video", do_sample=True, temperature=0.2, max_new_tokens=1024, use_cache=True, stopping_criteria=[stopping_criteria])
                 if "mistral" not in cfg_pretrained._name_or_path.lower():
-                    output_ids = model.generate(inputs=input_ids, images=video, attention_mask=attention_masks, modalities="video", do_sample=False, temperature=0.0, max_new_tokens=1024, top_p=0.1,num_beams=1,use_cache=True, stopping_criteria=[stopping_criteria])
+                    output_ids = model.generate(inputs=input_ids, images=video, attention_mask=attention_masks, modalities="video", do_sample=True, temperature=0.7, max_new_tokens=512, top_p=0.8, top_k=20, repetition_penalty=1.05, num_beams=1, use_cache=True, stopping_criteria=[stopping_criteria])
                     # output_ids = model.generate(inputs=input_ids, images=video, attention_mask=attention_masks, modalities="video", do_sample=True, temperature=0.2, max_new_tokens=1024, use_cache=True, stopping_criteria=[stopping_criteria])
                 else:
-                    output_ids = model.generate(inputs=input_ids, images=video, attention_mask=attention_masks, modalities="video", do_sample=False, temperature=0.0, max_new_tokens=1024, top_p=0.1, num_beams=1, use_cache=True)
-                    # output_ids = model.generate(inputs=input_ids, images=video, attention_mask=attention_masks, modalities="video", do_sample=True, temperature=0.2, max_new_tokens=1024, use_cache=True)
+                    output_ids = model.generate(inputs=input_ids, images=video, attention_mask=attention_masks, modalities="video", do_sample=True, temperature=0.7, max_new_tokens=512, top_p=0.8, top_k=20, repetition_penalty=1.05, num_beams=1, use_cache=True, stopping_criteria=[stopping_criteria])
         else:
             openai.api_key = args.api_key  # Your API key here
 
