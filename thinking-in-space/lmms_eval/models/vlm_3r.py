@@ -89,6 +89,8 @@ class Vlm3r(lmms):
         use_dual_memory: bool = True,
         memory_mode: str = "working_only",  # "working_only", "episodic_only", "both", or "off"
         memory_alpha: float = 0.3,  # fraction of output that comes from memory (0.3 = 30% memory, 70% original)
+        working_memory_size: int = None,  # if None, uses model default
+        episodic_memory_size: int = None,  # if None, uses model default
         checkpoint_adapter: str = None,  # optional: load base+LoRA then overlay adapter from this path (for pipeline verification)
         overlay_memory_only: bool = False,  # if True, only overlay working/episodic memory weights (fusion_block etc. are frozen in training so should match base; use as safeguard if eval load path differs)
         **kwargs,
@@ -156,6 +158,10 @@ class Vlm3r(lmms):
             overwrite_config["memory_mode"] = memory_mode
             overwrite_config["memory_alpha"] = memory_alpha
             overwrite_config["attn_implementation"] = attn_implementation
+            if working_memory_size is not None:
+                overwrite_config["working_memory_size"] = working_memory_size
+            if episodic_memory_size is not None:
+                overwrite_config["episodic_memory_size"] = episodic_memory_size
 
             # When using checkpoint_adapter, merge memory config from checkpoint so model is built with memory modules (good base + overlay).
             # Spatial/fusion (spatial_tower, fusion_block, etc.) stay from HF pretrained — just in case.

@@ -1,5 +1,5 @@
-# Use GPUS_PER_NODE from environment (set by SLURM) or default to 1
-GPUS_PER_NODE=${GPUS_PER_NODE:-${NUM_GPUS:-1}}
+#!/bin/bash
+GPUS_PER_NODE=${GPUS_PER_NODE:-1}
 if [ "$GPUS_PER_NODE" -gt 1 ]; then
   export CUDA_VISIBLE_DEVICES=$(seq -s, 0 $((GPUS_PER_NODE - 1)))
 else
@@ -7,13 +7,11 @@ else
 fi
 export LMMS_EVAL_LAUNCHER="accelerate"
 
-# NNODES from environment (set by SLURM script), defaults to 1 for single-node
 NNODES=${NNODES:-1}
 NODE_RANK=${NODE_RANK:-0}
 MASTER_ADDR=${MASTER_ADDR:-localhost}
 MASTER_PORT=${MASTER_PORT:-29500}
 
-# TOTAL_PROCESSES = total GPUs across all nodes
 TOTAL_PROCESSES=$((NNODES * GPUS_PER_NODE))
 NUM_GPUS=$GPUS_PER_NODE
 
@@ -31,9 +29,9 @@ accelerate launch \
     "${LAUNCH_ARGS[@]}" \
     -m lmms_eval \
     --model vlm_3r \
-    --model_args pretrained=Journey9ni/vlm-3r-llava-qwen2-lora,model_base=lmms-lab/LLaVA-NeXT-Video-7B-Qwen2,conv_template=qwen_1_5,max_frames_num=32,use_dual_memory=False \
-    --tasks vsibench \
+    --model_args pretrained=Journey9ni/vlm-3r-llava-qwen2-lora-vstibench,model_base=lmms-lab/LLaVA-NeXT-Video-7B-Qwen2,conv_template=qwen_1_5,max_frames_num=32,use_dual_memory=True,memory_mode=working_only,memory_alpha=0.5,working_memory_size=16,episodic_memory_size=8 \
+    --tasks vstibench \
     --batch_size 1 \
     --log_samples \
-    --log_samples_suffix vlm_3r_7b_qwen2_lora \
-    --output_path logs/$(TZ="America/New_York" date "+%Y%m%d")/vsibench
+    --log_samples_suffix vstibench_working_only_ws16_es8 \
+    --output_path logs/$(TZ="America/New_York" date "+%Y%m%d")/vstibench
