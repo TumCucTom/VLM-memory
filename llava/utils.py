@@ -64,13 +64,15 @@ def process_video_with_pyav(video_file, data_args, num_frames_override=None):
 
     ncap = num_frames_override if num_frames_override is not None else data_args.frames_upbound
     if ncap > 0:
-        if len(frame_idx) > ncap:
+        if len(frame_idx) > ncap or data_args.force_sample:
             uniform_sampled_frames = np.linspace(0, total_frame_num - 1, ncap, dtype=int)
             frame_idx = uniform_sampled_frames.tolist()
 
-
     frames = [video_frames[i] for i in frame_idx]
-    return np.stack([x.to_ndarray(format="rgb24") for x in frames])
+    video = np.stack([x.to_ndarray(format="rgb24") for x in frames])
+    frame_time = ",".join([f"{i:.2f}s" for i in range(len(frame_idx))])
+    num_frames_to_sample = len(frame_idx)
+    return video, video_time, frame_time, num_frames_to_sample
 
 
 def rank0_print(*args):

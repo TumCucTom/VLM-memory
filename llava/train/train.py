@@ -105,6 +105,33 @@ class StepProgressCallback(TrainerCallback):
             print(f"[Rank 0] Step {step}/{max_steps} done", flush=True)
 
 
+class MemoryTrimCallback(TrainerCallback):
+    """Return freed CPU heap pages to the OS after large video/depth batches."""
+
+    def __init__(self):
+        import ctypes
+
+        try:
+            self._malloc_trim = ctypes.CDLL("libc.so.6").malloc_trim
+            self._malloc_trim.argtypes = [ctypes.c_size_t]
+            self._malloc_trim.restype = ctypes.c_int
+        except Exception:
+            self._malloc_trim = None
+
+    def _trim(self):
+        import gc
+
+        gc.collect()
+        if self._malloc_trim is not None:
+            self._malloc_trim(0)
+
+    def on_substep_end(self, args, state, control, **kwargs):
+        self._trim()
+
+    def on_step_end(self, args, state, control, **kwargs):
+        self._trim()
+
+
 local_rank = None
 
 IS_TOKENIZER_GREATER_THAN_0_14 = version.parse(tokenizers.__version__) >= version.parse("0.14")
@@ -254,6 +281,12 @@ class ModelArguments:
     memory_lora_r: int = field(default=64, metadata={"help": "LoRA rank for memory attention modules"})
     memory_lora_alpha: int = field(default=128, metadata={"help": "LoRA alpha for memory attention modules"})
 
+    ## query-based selection (VideoStreaming Section 3.3)
+    use_query_selection: bool = field(default=False, metadata={"help": "Enable query-based clip selection (VideoStreaming style)"})
+    query_selection_num_select: int = field(default=4, metadata={"help": "Number of clips to select (V from VideoStreaming paper, default 4)"})
+    query_selection_temperature: float = field(default=1.0, metadata={"help": "Gumbel temperature for differentiable selection"})
+    query_selection_use_gumbel: bool = field(default=True, metadata={"help": "Use Gumbel-Topk (True) or hard Topk (False)"})
+
     unfreeze_mm_vision_tower: bool = field(default=False)
     unfreeze_language_model: bool = field(default=False)
     mm_vision_select_layer: Optional[int] = field(default=-1)  # default to the last layer
@@ -316,6 +349,7 @@ class DataArguments:
     first_n_steps_frames: Optional[int] = field(default=1, metadata={"help": "Number of steps to use first_step_frames before switching to frames_upbound (e.g. 3 = steps 0,1,2 use first_step_frames; step 3+ use frames_upbound)."})
     add_time_instruction: Optional[bool] = field(default=False)
     force_sample: Optional[bool] = field(default=False)
+    skip_point_maps_with_spatial_features: bool = field(default=False, metadata={"help": "Skip dense point-map construction when precomputed spatial features are available."})
 
 
 @dataclass
@@ -1413,7 +1447,7 @@ class LazySupervisedDataset(Dataset):
             sources = data_item
         processor = self.data_args.image_processor # Get processor from data_args
         image = []
-        point_maps = []
+        point_maps = None
         # --- Image Processing Branch ---
         if "image" in data_item:
             image_files = data_item["image"]
@@ -1615,7 +1649,7 @@ class LazySupervisedDataset(Dataset):
                         except IOError:
                             print(f"Failed to read frame at path: {frame_path}")
                 else:
-                    video, video_time, frame_time, num_frames_to_sample = process_video_with_decord(
+                    video, video_time, frame_time, num_frames_to_sample = process_video_with_pyav(
                         video_file, self.data_args, num_frames_override=self._get_effective_frames_upbound() or None
                     )
 
@@ -1708,28 +1742,46 @@ class LazySupervisedDataset(Dataset):
                 else:
                     sampled_indices = np.linspace(0, total_frames - 1, num_frames_to_sample, dtype=int)
 
+                spatial_features_path = os.path.join(
+                    base_folder,
+                    data_item['video'].replace('.mp4', '.pt').replace('videos', 'spatial_features'),
+                )
+                skip_point_maps = (
+                    getattr(self.data_args, "skip_point_maps_with_spatial_features", False)
+                    and os.path.exists(spatial_features_path)
+                )
+
                 all_points_world = []
                 all_color_images = []
                 # Depth scale (needs configuration per dataset source)
                 depth_scale = 1000.0 if data_source in ['scannet', 'scannetpp'] else 1.0 # Assume mm for scannet, meters otherwise (e.g., arkit)
 
-                # 4. Loop through sampled frames and unproject
+                # 4. Loop through sampled frames. CUT3R runs use precomputed spatial
+                # features, so dense point maps are unnecessary host-memory churn.
                 for frame_idx in sampled_indices:
                     try:
                         depth_file = os.path.join(depth_folder, all_depth_files[frame_idx])
                         pose_file = os.path.join(poses_folder, all_poses_files[frame_idx])
                         color_file = os.path.join(color_folder, all_color_files[frame_idx])
 
-                        depth_pil = Image.open(depth_file)
-                        color_pil = Image.open(color_file)
+                        with Image.open(color_file) as color_pil:
+                            color_array = np.array(color_pil.convert("RGB"))
+
+                        if skip_point_maps:
+                            all_color_images.append(color_array)
+                            continue
+
+                        with Image.open(depth_file) as depth_pil:
+                            depth_mode = depth_pil.mode
+                            depth_raw = np.array(depth_pil)
                         # Convert depth based on mode and apply scale
-                        if depth_pil.mode == 'I;16': depth_map = np.array(depth_pil, dtype=np.uint16).astype(np.float32) / depth_scale
-                        elif depth_pil.mode == 'I': depth_map = np.array(depth_pil, dtype=np.int32).astype(np.float32) / depth_scale
-                        elif depth_pil.mode == 'F': depth_map = np.array(depth_pil, dtype=np.float32) / depth_scale
-                        elif depth_pil.mode == 'L': depth_map = np.array(depth_pil, dtype=np.uint8).astype(np.float32) / depth_scale
+                        if depth_mode == 'I;16': depth_map = depth_raw.astype(np.uint16).astype(np.float32) / depth_scale
+                        elif depth_mode == 'I': depth_map = depth_raw.astype(np.int32).astype(np.float32) / depth_scale
+                        elif depth_mode == 'F': depth_map = depth_raw.astype(np.float32) / depth_scale
+                        elif depth_mode == 'L': depth_map = depth_raw.astype(np.uint8).astype(np.float32) / depth_scale
                         else:
-                             rank0_print(f"Warning: Unexpected depth image mode '{depth_pil.mode}' for {depth_file}. Trying direct conversion.")
-                             depth_map = np.array(depth_pil).astype(np.float32) / depth_scale
+                             rank0_print(f"Warning: Unexpected depth image mode '{depth_mode}' for {depth_file}. Trying direct conversion.")
+                             depth_map = depth_raw.astype(np.float32) / depth_scale
 
                         if len(depth_map.shape) != 2: raise ValueError(f"Depth map at {depth_file} is not 2D (shape: {depth_map.shape})")
 
@@ -1769,10 +1821,7 @@ class LazySupervisedDataset(Dataset):
 
                         # Load color image (already done earlier potentially, ensure it's loaded here if needed)
                         # Assuming color_pil is already loaded for this frame_idx
-                        if not isinstance(color_pil, np.ndarray): # Convert if it's still PIL
-                             all_color_images.append(np.array(color_pil))
-                        else: # Already numpy
-                             all_color_images.append(color_pil)
+                        all_color_images.append(color_array)
 
 
                     except Exception as frame_e:
@@ -1780,21 +1829,22 @@ class LazySupervisedDataset(Dataset):
                         # Re-raise the caught exception to allow the outer exception handler to skip the entire scene
                         raise
 
-                if not all_points_world:
+                if not skip_point_maps and not all_points_world:
                     raise ValueError(f"No valid points generated for scene {scene_name} after processing all sampled frames.")
 
                 # 5. stack all points and resize to 384*384
-                point_maps = np.stack(all_points_world, axis=0) # (N, H, W, 3)
-                resized_point_maps = []
-                for i in range(point_maps.shape[0]):
-                    point_map = point_maps[i]
-                    point_map = cv2.resize(point_map, (384, 384), interpolation=cv2.INTER_NEAREST)
-                    resized_point_maps.append(point_map)
-                
-                point_maps = np.stack(resized_point_maps, axis=0) # (N, 384, 384, 3)
-                point_maps = torch.from_numpy(point_maps).float()
-                # B H W 3 -> B 3 H W
-                point_maps = point_maps.permute(0, 3, 1, 2)
+                if not skip_point_maps:
+                    point_maps = np.stack(all_points_world, axis=0) # (N, H, W, 3)
+                    resized_point_maps = []
+                    for i in range(point_maps.shape[0]):
+                        point_map = point_maps[i]
+                        point_map = cv2.resize(point_map, (384, 384), interpolation=cv2.INTER_NEAREST)
+                        resized_point_maps.append(point_map)
+
+                    point_maps = np.stack(resized_point_maps, axis=0) # (N, 384, 384, 3)
+                    point_maps = torch.from_numpy(point_maps).float()
+                    # B H W 3 -> B 3 H W
+                    point_maps = point_maps.permute(0, 3, 1, 2)
                 # process color images
                 color_images = np.stack(all_color_images, axis=0) # (N, H, W, 3)
                 processor = self.data_args.image_processor
@@ -1900,7 +1950,7 @@ class LazySupervisedDataset(Dataset):
                 data_dict["spatial_features"] = spatial_features
 
         # add point cloud
-        if "_with_depth" in self.list_data_dict[i] and self.list_data_dict[i]["_with_depth"]:
+        if "_with_depth" in self.list_data_dict[i] and self.list_data_dict[i]["_with_depth"] and point_maps is not None:
             data_dict["point_maps"] = point_maps
 
         return data_dict
@@ -2413,9 +2463,22 @@ def train(attn_implementation=None):
         model.config.faster_token_stride = model_args.faster_token_stride
         model.config.add_time_instruction = data_args.add_time_instruction
         model.config.force_sample = data_args.force_sample
-        model.config.mm_spatial_pool_stride = model_args.mm_spatial_pool_stride 
+        model.config.mm_spatial_pool_stride = model_args.mm_spatial_pool_stride
 
         ### Deciding train which part of the model
+
+        # VideoStreaming-style query-based selection config (applies to both paths)
+        use_query_selection = getattr(model_args, 'use_query_selection', False)
+        model.config.use_query_selection = use_query_selection
+        if use_query_selection:
+            model.config.use_dual_memory = False
+            if hasattr(model, "get_model"):
+                model.get_model().config.use_dual_memory = False
+            model.config.query_selection_num_select = getattr(model_args, 'query_selection_num_select', 4)
+            model.config.query_selection_temperature = getattr(model_args, 'query_selection_temperature', 1.0)
+            model.config.query_selection_use_gumbel = getattr(model_args, 'query_selection_use_gumbel', True)
+            rank0_print(f"Query-based selection enabled: select {model.config.query_selection_num_select} clips")
+
         if model_args.mm_tunable_parts is None:  # traditional way of deciding which part to train
             model.config.tune_mm_mlp_adapter = training_args.tune_mm_mlp_adapter = model_args.tune_mm_mlp_adapter
             model.config.tune_mm_vision_resampler = training_args.tune_mm_vision_resampler = model_args.tune_mm_vision_resampler
@@ -2423,7 +2486,7 @@ def train(attn_implementation=None):
             model.config.tune_fusion_block = training_args.tune_fusion_block = model_args.tune_fusion_block
             model.config.tune_memory_components = training_args.tune_memory_components = getattr(model_args, 'tune_memory_components', False)
             model.config.memory_mode = getattr(model_args, 'memory_mode', 'working_only')
-            
+
             # Phase 1: If training memory components, freeze everything else
             # Phase 1 trains only memory components, keeping fusion block and MM projector frozen
             if model_args.tune_memory_components:
@@ -2597,6 +2660,28 @@ def train(attn_implementation=None):
                     for p in model_base.memory_fusion_mlp.parameters():
                         p.requires_grad = True
                     rank0_print("  - memory_fusion_mlp: trainable")
+            if "query_selection" in tunable_parts:
+                rank0_print("Unfreezing query_selection components...")
+                if not hasattr(model, 'get_model'):
+                    rank0_print("  - model.get_model() not available, skipping query_selection")
+                else:
+                    model_base = model.get_model()
+                    # Propagate query_selection config to model_base so lazy init can read it
+                    model_base.config.use_query_selection = getattr(model.config, 'use_query_selection', False)
+                    model_base.config.use_dual_memory = False
+                    model_base.config.query_selection_num_select = getattr(model.config, 'query_selection_num_select', 4)
+                    model_base.config.query_selection_temperature = getattr(model.config, 'query_selection_temperature', 1.0)
+                    model_base.config.query_selection_use_gumbel = getattr(model.config, 'query_selection_use_gumbel', True)
+                    # Trigger lazy initialization via get_query_selection()
+                    query_sel = model_base.get_query_selection()
+                    if query_sel is not None:
+                        for p in query_sel.parameters():
+                            p.requires_grad = True
+                        rank0_print("  - query_selection: trainable")
+                    else:
+                        rank0_print("  - query_selection module not found or is None in model")
+                # Also disable dual memory when using query selection
+                model.config.use_dual_memory = False
 
         total_params = sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in model.parameters())
         trainable_params = sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in model.parameters() if p.requires_grad)
@@ -2630,9 +2715,16 @@ def train(attn_implementation=None):
                     if training_args.bf16 and module.weight.dtype == torch.float32:
                         module = module.to(torch.bfloat16)
 
+    data_args.skip_point_maps_with_spatial_features = bool(
+        getattr(model_args, "spatial_tower", None)
+        and "cut3r" in str(model_args.spatial_tower).lower()
+    )
+    if data_args.skip_point_maps_with_spatial_features:
+        rank0_print("Skipping dense point-map construction when precomputed CUT3R spatial features are available.")
+
     data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
     effective_frames_value = data_module.pop("effective_frames_value", None)
-    callbacks = [StepProgressCallback()]
+    callbacks = [StepProgressCallback(), MemoryTrimCallback()]
     if effective_frames_value is not None:
         callbacks.append(FirstStepFramesCallback(effective_frames_value, data_args))
     trainer = LLaVATrainer(model=model, tokenizer=tokenizer, args=training_args, callbacks=callbacks, **data_module)

@@ -28,6 +28,7 @@ from .multimodal_resampler.builder import build_vision_resampler
 from .multimodal_projector.builder import build_vision_projector
 from .memory.working_memory import WorkingMemory
 from .memory.episodic_memory import EpisodicMemory
+from .query_selection import QueryBasedSelection
 from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 
 from llava.mm_utils import get_anyres_image_grid_shape
@@ -105,6 +106,27 @@ class LlavaMetaModel:
                 nn.Sigmoid()  # Output gate values in [0, 1]
             )
 
+            # Query-Based Selection (VideoStreaming Section 3.3)
+            # Initialize when use_query_selection config is set
+            # Note: Only initialize if config.use_query_selection is True at init time.
+            # If it will be set later (via config propagation after model creation),
+            # lazy init in get_query_selection() will handle it.
+            use_query_selection = getattr(config, 'use_query_selection', False)
+            if use_query_selection:
+                num_select = getattr(config, 'query_selection_num_select', 4)
+                temperature = getattr(config, 'query_selection_temperature', 1.0)
+                # Use bfloat16 explicitly for training - inputs are bfloat16
+                qs_dtype = torch.bfloat16
+                self.query_selection = QueryBasedSelection(
+                    feature_dim=config.hidden_size,
+                    llm_dim=config.hidden_size,
+                    num_select=num_select,
+                    temperature=temperature,
+                    use_gumbel=getattr(config, 'query_selection_use_gumbel', True),
+                ).to(qs_dtype)
+            # Note: Do NOT set self.query_selection = None here. Lazy init will handle
+            # the case where use_query_selection is set to True after model creation.
+
             if "unpad" in getattr(config, "mm_patch_merge_type", ""):
                 self.image_newline = nn.Parameter(torch.empty(config.hidden_size, dtype=self.dtype))
 
@@ -133,7 +155,76 @@ class LlavaMetaModel:
     def get_episodic_memory(self):
         """Get episodic memory module"""
         return getattr(self, "episodic_memory", None)
-    
+
+    def get_query_selection(self):
+        """Get query selection module, lazily initializing if needed"""
+        query_sel = getattr(self, "query_selection", None)
+        if query_sel is None and getattr(self.config, 'use_query_selection', False):
+            query_sel = self._init_query_selection()
+        return query_sel
+
+    def _init_query_selection(self):
+        """Lazy initialization of QueryBasedSelection module"""
+        if not getattr(self.config, 'use_query_selection', False):
+            return None
+        from .query_selection import QueryBasedSelection
+        num_select = getattr(self.config, 'query_selection_num_select', 4)
+        temperature = getattr(self.config, 'query_selection_temperature', 1.0)
+        # Use bfloat16 explicitly for training - inputs are bfloat16
+        qs_dtype = torch.bfloat16
+        self.query_selection = QueryBasedSelection(
+            feature_dim=self.config.hidden_size,
+            llm_dim=self.config.hidden_size,
+            num_select=num_select,
+            temperature=temperature,
+            use_gumbel=getattr(self.config, 'query_selection_use_gumbel', True),
+        ).to(qs_dtype)
+        return self.query_selection
+
+    def _apply_query_selection(self, image_features: torch.Tensor, question_embeds: torch.Tensor, question_mask: torch.Tensor = None) -> torch.Tensor:
+        """
+        Apply Query-Based Selection (VideoStreaming Section 3.3)
+
+        Args:
+            image_features: [B, T, N, D] or [B, T, D] or [T, N, D] - clip features after mm_projector
+            question_embeds: [B, L, D] - text embeddings from LLM
+            question_mask: [B, L] - attention mask for question
+
+        Returns:
+            selected_features: [B, V, N, D] or [B, V, D] - V selected clips
+        """
+        # Ensure query_selection is initialized
+        qs = self.get_query_selection()
+        if qs is None:
+            return image_features
+
+        qs_param = next(qs.parameters(), None)
+        target_dtype = qs_param.dtype if qs_param is not None else image_features.dtype
+        if image_features.is_floating_point():
+            target_dtype = image_features.dtype
+        target_device = image_features.device
+        if qs_param is not None and (qs_param.dtype != target_dtype or qs_param.device != target_device):
+            qs = qs.to(device=target_device, dtype=target_dtype)
+            self.query_selection = qs
+
+        # Handle 3D case: [T, N, D] -> [1, T, N, D] or [B*T, N, D] -> [B, T, N, D]
+        if image_features.dim() == 3:
+            # Try to determine batch size from question_embeds if available
+            if question_embeds is not None and question_embeds.dim() == 3:
+                B_q = question_embeds.shape[0]
+                # Assume [B, T, D] format where B matches question batch
+                image_features = image_features.unsqueeze(0)  # [T, N, D] -> [1, T, N, D]
+            else:
+                # Cannot determine batch size, return unchanged
+                return image_features
+
+        # Match the query-selection module dtype/device.
+        image_features = image_features.to(device=target_device, dtype=target_dtype)
+        if question_embeds is not None:
+            question_embeds = question_embeds.to(device=target_device, dtype=target_dtype)
+
+        return qs(image_features, question_embeds, question_mask)
+
     def _apply_dual_memory(self, H_t: torch.Tensor) -> torch.Tensor:
         """
         Apply Dual Memory System (Algorithm 1 from VLM² paper)
@@ -802,7 +893,20 @@ class LlavaMetaForCausalLM(ABC):
             
             else:
                 if spatial_features is not None and 'cut3r' in spatial_encoder_type:
-                    camera_tokens, patch_tokens = spatial_features[0]["camera_tokens"], spatial_features[0]["patch_tokens"]
+                    cached_spatial_features = spatial_features[0] if isinstance(spatial_features, (list, tuple)) else spatial_features
+                    if isinstance(cached_spatial_features, dict) and {"camera_tokens", "patch_tokens"}.issubset(cached_spatial_features):
+                        camera_tokens = cached_spatial_features["camera_tokens"]
+                        patch_tokens = cached_spatial_features["patch_tokens"]
+                        if camera_tokens.shape[0] != image_features.shape[0] or patch_tokens.shape[0] != image_features.shape[0]:
+                            rank0_print(
+                                "Ignoring cached CUT3R spatial features with frame count "
+                                f"camera={camera_tokens.shape[0]}, patch={patch_tokens.shape[0]}, "
+                                f"rgb={image_features.shape[0]}; recomputing for sampled frames."
+                            )
+                            camera_tokens, patch_tokens = self.get_model().get_spatial_tower()(images)
+                    else:
+                        rank0_print("Ignoring malformed cached CUT3R spatial features; recomputing for sampled frames.")
+                        camera_tokens, patch_tokens = self.get_model().get_spatial_tower()(images)
                 else:
                     camera_tokens, patch_tokens = self.get_model().get_spatial_tower()(images)
                 
@@ -939,17 +1043,93 @@ class LlavaMetaForCausalLM(ABC):
         image_feature = image_feature.permute(1, 2, 0).contiguous()
         return image_feature
 
+    def _features_as_query_clips(self, image_features, num_frames=None):
+        """Convert per-sample media tokens into [1, T, N, D] clips."""
+        if image_features is None or image_features.shape[0] == 0:
+            return None
+        if image_features.dim() == 4:
+            return image_features
+        if image_features.dim() == 3:
+            return image_features.unsqueeze(0)
+        if image_features.dim() != 2:
+            return None
+
+        total_tokens = image_features.shape[0]
+        frame_candidates = []
+        if num_frames is not None:
+            try:
+                frame_count = int(num_frames)
+                if frame_count > 0:
+                    frame_candidates.append(frame_count)
+            except (TypeError, ValueError):
+                pass
+
+        configured_frames = getattr(self.get_model().config, "frames_upbound", None)
+        if configured_frames:
+            try:
+                configured_frames = int(configured_frames)
+                if configured_frames > 0:
+                    frame_candidates.append(configured_frames)
+            except (TypeError, ValueError):
+                pass
+
+        for frame_count in dict.fromkeys(frame_candidates):
+            if total_tokens % frame_count == 0:
+                return image_features.view(1, frame_count, total_tokens // frame_count, -1)
+
+        return image_features.view(1, 1, total_tokens, -1)
+
+    def _flatten_media_features(self, image_features):
+        """Return media features as a flat [tokens, hidden] tensor for LLM input."""
+        if image_features is None:
+            return None
+        if image_features.dim() <= 2:
+            return image_features
+        return image_features.flatten(0, image_features.dim() - 2)
+
+    def _maybe_apply_query_selection(self, image_features, question_embeds, question_mask=None, num_frames=None):
+        model_config = self.get_model().config
+        qs = self.get_model().get_query_selection()
+        use_qs = getattr(model_config, "use_query_selection", False)
+        if not (use_qs and qs is not None and self.training):
+            return self._flatten_media_features(image_features)
+
+        if image_features is None or image_features.shape[0] == 0:
+            return self._flatten_media_features(image_features)
+
+        # Query-based selection is frame selection; leave single images unchanged.
+        if num_frames is not None:
+            try:
+                if int(num_frames) <= 1:
+                    return self._flatten_media_features(image_features)
+            except (TypeError, ValueError):
+                pass
+
+        query_features = self._features_as_query_clips(image_features, num_frames=num_frames)
+        if query_features is None:
+            return self._flatten_media_features(image_features)
+
+        selected_features = self.get_model()._apply_query_selection(query_features, question_embeds, question_mask)
+        return self._flatten_media_features(selected_features)
+
     def prepare_inputs_labels_for_multimodal(self, input_ids, position_ids, attention_mask, past_key_values, labels, images, spatial_features=None, point_maps=None, modalities=["image"], image_sizes=None):
         vision_tower = self.get_vision_tower()
         # rank_print(modalities)
+        if _DEBUG_GRAD:
+            print(f"[PREPARE] called: images type={type(images)}, ndim={images.ndim if hasattr(images, 'ndim') else 'N/A'}", flush=True)
         if vision_tower is None or images is None or input_ids.shape[1] == 1:
+            if _DEBUG_GRAD:
+                print("[PREPARE] early return", flush=True)
             return input_ids, position_ids, attention_mask, past_key_values, None, labels
 
         if isinstance(modalities, str):
             modalities = [modalities]
 
         # import pdb; pdb.set_trace()
+        feature_frame_counts = None
         if type(images) is list or images.ndim == 5:
+            if _DEBUG_GRAD:
+                print(f"[PREPARE] images is list={type(images) is list} or ndim=5, processing...", flush=True)
             if type(images) is list:
                 images = [x.unsqueeze(0) if x.ndim == 3 else x for x in images]
 
@@ -967,6 +1147,7 @@ class LlavaMetaForCausalLM(ABC):
 
             concat_images = torch.cat([image for image in images_list], dim=0)
             split_sizes = [image.shape[0] for image in images_list]
+            feature_frame_counts = split_sizes
             encoded_image_features = self.encode_images(concat_images, spatial_features, point_maps)
             # if self.get_model().get_spatial_tower() is not None:
             #     if spatial_features is None:
@@ -1187,13 +1368,22 @@ class LlavaMetaForCausalLM(ABC):
                 # Video/image sample but tokenizer produced no image placeholder (num_images==0).
                 # Insert image features so the model sees them and gradient flows (fixes 0 grad_norm).
                 cur_image_features = image_features[cur_image_idx]
+                cur_frame_count = feature_frame_counts[cur_image_idx] if feature_frame_counts and cur_image_idx < len(feature_frame_counts) else None
 
                 cur_input_embeds_1 = self.get_model().embed_tokens(cur_input_ids)
+                question_embeds = cur_input_embeds_1.unsqueeze(0)
+                question_mask = torch.ones(1, question_embeds.shape[1], dtype=torch.bool, device=question_embeds.device)
+                cur_image_features = self._maybe_apply_query_selection(
+                    cur_image_features,
+                    question_embeds,
+                    question_mask,
+                    num_frames=cur_frame_count,
+                )
 
                 embeds_to_concat = []
                 cur_labels_slice = labels[batch_idx]
                 if cur_image_features is not None and cur_image_features.shape[0] > 0:
-                    embeds_to_concat.append(cur_image_features.to(cur_input_embeds_1.device))
+                    embeds_to_concat.append(cur_image_features.to(device=cur_input_embeds_1.device, dtype=cur_input_embeds_1.dtype))
                     ignore_labels = torch.full(
                         (cur_image_features.shape[0],), IGNORE_INDEX, device=cur_labels_slice.device, dtype=cur_labels_slice.dtype
                     )
@@ -1240,11 +1430,23 @@ class LlavaMetaForCausalLM(ABC):
                         #     cur_camera_tokens = camera_tokens[cur_image_idx - 1]
                         #     cur_patch_tokens = patch_tokens[cur_image_idx - 1]
 
+                    cur_frame_count = feature_frame_counts[cur_image_idx] if feature_frame_counts and cur_image_idx < len(feature_frame_counts) else None
                     cur_image_idx += 1
 
                     # Debug: check image features grad
                     if _DEBUG_GRAD and self.training and i == 0:
                         print(f"[DEBUG] cur_image_features grad: requires_grad={getattr(cur_image_features, 'requires_grad', False)}")
+
+                    # Apply VideoStreaming query-based selection if enabled (Section 3.3)
+                    # Selects top-V clips based on cosine similarity with question embeddings
+                    question_embeds = torch.cat(list(cur_input_embeds_no_im), dim=0).unsqueeze(0)  # [1, L, D]
+                    question_mask = torch.ones(1, question_embeds.shape[1], dtype=torch.bool, device=question_embeds.device)
+                    cur_image_features = self._maybe_apply_query_selection(
+                        cur_image_features,
+                        question_embeds,
+                        question_mask,
+                        num_frames=cur_frame_count,
+                    )
 
                     # Prepare combined features (visual + spatial)
                     features_to_insert = []
@@ -1314,8 +1516,9 @@ class LlavaMetaForCausalLM(ABC):
         tokenizer_model_max_length = getattr(self.config, "tokenizer_model_max_length", None)
         # rank_print("Finishing Inserting")
 
-        new_input_embeds = [x[:tokenizer_model_max_length] for x, modality in zip(new_input_embeds, modalities)]
-        new_labels = [x[:tokenizer_model_max_length] for x, modality in zip(new_labels, modalities)]
+        if tokenizer_model_max_length is not None:
+            new_input_embeds = [x[:tokenizer_model_max_length] for x in new_input_embeds]
+            new_labels = [x[:tokenizer_model_max_length] for x in new_labels]
         # Debug: check grad after truncation (unconditional)
         if _DEBUG_GRAD and self.training and new_input_embeds:
             print(f"[DEBUG] after truncation: new_input_embeds[0].requires_grad={getattr(new_input_embeds[0], 'requires_grad', False)}")
@@ -1325,6 +1528,12 @@ class LlavaMetaForCausalLM(ABC):
         #     new_labels = [x[:4096] if modality != "video" else x[:tokenizer_model_max_length] for x, modality in zip(new_labels, modalities)]
 
         # Combine them
+        if not new_input_embeds:
+            raise ValueError(
+                "prepare_inputs_labels_for_multimodal produced no input embeddings "
+                f"(batch={len(input_ids)}, media={len(image_features) if isinstance(image_features, list) else 'tensor'}, "
+                f"modalities={modalities})"
+            )
         max_len = max(x.shape[0] for x in new_input_embeds)
         batch_size = len(new_input_embeds)
 
