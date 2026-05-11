@@ -6,7 +6,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
-#SBATCH --mem=128G
+#SBATCH --mem=400G
 #SBATCH --gres=gpu:4
 #SBATCH --partition=workq
 
@@ -24,11 +24,20 @@ export LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:${CUDA_HOME}/lib64" 2>/dev/null || tr
 echo "Job ID: $SLURM_JOB_ID" && echo "Start Time: $(date)"
 
 source ~/miniforge3/bin/activate
-conda activate vlm3r
+conda activate pytorch-cu128
 
 export PROJECT_DIR="${PROJECT_DIR:-$HOME/scratch/VLM-memory}"
 cd "$PROJECT_DIR"
 mkdir -p logs/eval
+export HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
+export HUGGINGFACE_HUB_CACHE="${HUGGINGFACE_HUB_CACHE:-${HF_HOME}/hub}"
+export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
+export TMPDIR="${PROJECT_DIR}/.tmp/${SLURM_JOB_ID}"
+export XDG_CACHE_HOME="${PROJECT_DIR}/.cache/${SLURM_JOB_ID}"
+export TORCHINDUCTOR_CACHE_DIR="${XDG_CACHE_HOME}/torchinductor"
+export TRITON_CACHE_DIR="${XDG_CACHE_HOME}/triton"
+export TORCH_HOME="${XDG_CACHE_HOME}/torch"
+mkdir -p "${TMPDIR}" "${HF_HOME}" "${HUGGINGFACE_HUB_CACHE}" "${HF_DATASETS_CACHE}" "${TORCHINDUCTOR_CACHE_DIR}" "${TRITON_CACHE_DIR}" "${TORCH_HOME}"
 
 # Checkpoint to eval (set EVAL_CHECKPOINT before sbatch to override). Default: working-memory training run (use run dir so non_lora_trainables.bin is found; or use run_dir/checkpoint-N). Eval uses adapter-overlay (base+LoRA + overlay). Set EVAL_USE_DUAL_MEMORY=False for no-memory checkpoints.
 # Optional: EVAL_OVERLAY_MEMORY_ONLY=True overlays only memory weights (fusion_block etc. are frozen in training and should match base; use if full overlay gives unexpectedly low scores).
@@ -36,6 +45,7 @@ export EVAL_CHECKPOINT="${EVAL_CHECKPOINT:-work_dirs/vlm2-working-memory-only-Lw
 export EVAL_USE_DUAL_MEMORY="${EVAL_USE_DUAL_MEMORY:-True}"
 export EVAL_OVERLAY_MEMORY_ONLY="${EVAL_OVERLAY_MEMORY_ONLY:-False}"
 export PYTHONWARNINGS=ignore
+export LLAVA_DEBUG_GRAD=0
 export TOKENIZERS_PARALLELISM=false
 export LMMS_EVAL_LAUNCHER="accelerate"
 export NUM_GPUS_PER_NODE=${SLURM_GPUS_ON_NODE:-4}

@@ -2,6 +2,7 @@
 # Set EVAL_CHECKPOINT to the checkpoint path.
 # Always uses adapter-overlay: load base+LoRA (good baseline) then overlay adapter+memory from checkpoint,
 # so memory performance is on top of the same 60.85% base. Set EVAL_USE_DUAL_MEMORY=False for no-memory checkpoints.
+set -euo pipefail
 
 NUM_GPUS=${NUM_GPUS:-1}
 NNODES=${NNODES:-1}
