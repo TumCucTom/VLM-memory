@@ -270,12 +270,20 @@ class LengthGroupedSampler(Sampler):
 
 
 class LLaVATrainer(Trainer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._step_count = 0
+
     def training_step(self, model, inputs):
-        # Clear dual memory at the start of each step so each batch (video) gets fresh memory (align with eval).
+        self._step_count += 1
+        # Clear memory only at the start of a new logical batch (not on every micro-batch during gradient accumulation)
+        # grad_accumulation_steps is the number of micro-batches per logical batch
         from transformers.modeling_utils import unwrap_model
         inner = unwrap_model(model)
         if getattr(inner, "clear_all_memory", None) is not None:
-            inner.clear_all_memory()
+            # Only clear if this is the first micro-batch in a logical batch
+            if (self._step_count - 1) % self.args.gradient_accumulation_steps == 0:
+                inner.clear_all_memory()
         return super().training_step(model, inputs)
 
     def create_accelerator_and_postprocess(self):
