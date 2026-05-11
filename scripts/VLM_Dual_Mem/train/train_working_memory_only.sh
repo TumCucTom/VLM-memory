@@ -31,8 +31,8 @@ MEMORY_DROPOUT=0.5
 # Training: hyperparams for 8-node (32 GPU) run. Effective batch = num_gpus * batch_size * grad_accum = 32*1*4 = 128.
 NUM_TRAIN_EPOCHS=3
 LEARNING_RATE=1e-5
-BATCH_SIZE=2
-GRADIENT_ACCUMULATION_STEPS=8
+BATCH_SIZE=1
+GRADIENT_ACCUMULATION_STEPS=32
 SAVE_TOTAL_LIMIT=3
 # Resume: set RESUME_FROM_CHECKPOINT=true (or path to checkpoint) to resume; default is no resume
 RESUME_FROM_CHECKPOINT="${RESUME_FROM_CHECKPOINT:-}"
@@ -40,7 +40,7 @@ RESUME_FROM_CHECKPOINT="${RESUME_FROM_CHECKPOINT:-}"
 # Data (same layout as phase1 – adjust if your paths differ; slurm can override via DATA_YAML)
 DATA_YAML="${DATA_YAML:-scripts/VLM_3R/vsibench_data_no_route_plan.yaml}"
 IMAGE_FOLDER="data/vlm_3r_data"
-VIDEO_FOLDER="data/vlm_3r_data"
+VIDEO_FOLDER="data"
 
 RUN_NAME="vlm2-working-memory-only-Lw8"
 OUTPUT_DIR="work_dirs/${RUN_NAME}"
@@ -125,9 +125,8 @@ ACCELERATE_CPU_AFFINITY=0 torchrun \
     --gradient_checkpointing True \
     --dataloader_num_workers 2 \
     --lazy_preprocess True \
-    --report_to wandb \
+    --report_to none \
     --torch_compile False \
-    --torch_compile_backend "inductor" \
     --dataloader_drop_last True \
     --frames_upbound ${FRAMES_UPBOUND:-32} \
     --mm_newline_position grid

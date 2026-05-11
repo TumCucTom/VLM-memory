@@ -1,0 +1,13 @@
+# VSTI-Bench-style training data used for VSTI-specific memory training.
+datasets:
+  - json_path: data/raw_data/VLM-3R-DATA/vstibench_train/qa_camera_displacement.json
+  - json_path: data/raw_data/VLM-3R-DATA/vstibench_train/qa_camera_movement_direction_v1.json
+  - json_path: data/raw_data/VLM-3R-DATA/vstibench_train/qa_camera_movement_direction_v2.json
+  - json_path: data/raw_data/VLM-3R-DATA/vstibench_train/qa_camera_movement_direction_v3.json
+  - json_path: data/raw_data/VLM-3R-DATA/vstibench_train/qa_camera_obj_abs_dist.json
+  - json_path: data/raw_data/VLM-3R-DATA/vstibench_train/qa_camera_obj_rel_dist_v1.json
+  - json_path: data/raw_data/VLM-3R-DATA/vstibench_train/qa_camera_obj_rel_dist_v2.json
+  - json_path: data/raw_data/VLM-3R-DATA/vstibench_train/qa_camera_obj_rel_dist_v3.json
+  - json_path: data/raw_data/VLM-3R-DATA/vstibench_train/qa_obj_obj_relative_pos_lr.json
+  - json_path: data/raw_data/VLM-3R-DATA/vstibench_train/qa_obj_obj_relative_pos_nf.json
+  - json_path: data/raw_data/VLM-3R-DATA/vstibench_train/qa_obj_obj_relative_pos_ud.json

@@ -1,10 +1,10 @@
 #!/bin/bash
-#SBATCH --job-name=wm_only_Lw8
-#SBATCH --output=logs/train/working_memory_only_%j.out
-#SBATCH --error=logs/train/working_memory_only_%j.err
-#SBATCH --time=3:00:00
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
+#SBATCH --job-name=qsel_lora_128to32
+#SBATCH --output=logs/train/query_selection_lora_%j.out
+#SBATCH --error=logs/train/query_selection_lora_%j.err
+#SBATCH --time=24:00:00
+#SBATCH --nodes=16
+#SBATCH --ntasks=16
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=400G
@@ -28,6 +28,8 @@ echo "Number of GPUs: $SLURM_GPUS_ON_NODE"
 echo "CUDA_HOME: ${CUDA_HOME:-<unset>}"
 echo "GCC: $(gcc --version 2>/dev/null | head -1 || echo 'default')"
 
+export WANDB_API_KEY
+
 source ~/miniforge3/bin/activate
 conda activate vlm3r-2
 
@@ -36,43 +38,46 @@ echo "PyTorch: $(python -c 'import torch; print(torch.__version__)')"
 echo "CUDA available: $(python -c 'import torch; print(torch.cuda.is_available())')"
 echo "CUDA devices: $(python -c 'import torch; print(torch.cuda.device_count() if torch.cuda.is_available() else 0)')"
 
-PROJECT_DIR="${PROJECT_DIR:-$HOME/scratch/VLM-memory}"
+export PROJECT_DIR="${PROJECT_DIR:-$HOME/scratch/VLM-memory}"
 cd "$PROJECT_DIR"
 
-# Set environment variables
 export PYTHONWARNINGS=ignore
 export TOKENIZERS_PARALLELISM=false
+export CUDA_LAUNCH_BLOCKING=${CUDA_LAUNCH_BLOCKING:-0}
 
-# Enable CUDA debugging to get better error messages
-export CUDA_LAUNCH_BLOCKING=1
-
-# Set bitsandbytes CUDA version and paths (CUDA 12.6)
 export BNB_CUDA_VERSION=126
-# Help bitsandbytes find CUDA libraries
 export BITSANDBYTES_NOWELCOME=1
-# Point to the actual CUDA library location
 export LD_LIBRARY_PATH=/opt/nvidia/hpc_sdk/Linux_aarch64/24.11/cuda/12.6/targets/sbsa-linux/lib:$LD_LIBRARY_PATH
 
-mkdir -p logs
+mkdir -p logs/train
 
 export PYTHONWARNINGS=ignore
 export TOKENIZERS_PARALLELISM=false
 export NUM_GPUS_PER_NODE=${SLURM_GPUS_ON_NODE:-4}
 export NCCL_TIMEOUT=86400
 export TORCH_NCCL_BLOCKING_WAIT=1
+export SAVE_ONLY_MODEL="${SAVE_ONLY_MODEL:-True}"
+export JOB_CACHE_BASE="${PROJECT_DIR}/.cache/${SLURM_JOB_ID}"
+mkdir -p "${JOB_CACHE_BASE}"
 
-# Use filtered vsibench (scannet + scannetpp + route_plan); only samples with existing videos
-export DATA_YAML="scripts/VLM_3R/vsibench_data_no_route_plan.yaml"
+# Same ScanNet-only data as the query-only training run.
+export DATA_YAML="${DATA_YAML:-scripts/VLM_3R/vsibench_data_no_route_plan.yaml}"
 
-# Multinode: first node is master; srun runs one task per node so each gets correct NODE_RANK
+# Multinode: first node is master; srun runs one task per node so each gets correct NODE_RANK.
 if [ "${SLURM_NNODES:-1}" -gt 1 ]; then
   export MASTER_ADDR=$(scontrol show hostnames "$SLURM_NODELIST" | head -1)
-  export MASTER_PORT=${MASTER_PORT:-29500}
+  export MASTER_PORT=${MASTER_PORT:-$((29500 + SLURM_JOB_ID % 1000))}
   export NNODES=$SLURM_NNODES
   srun --ntasks=$SLURM_NNODES --ntasks-per-node=1 --kill-on-bad-exit=1 \
-    bash -c 'export NODE_RANK=$SLURM_PROCID; bash scripts/VLM_Dual_Mem/train/train_working_memory_only.sh'
+    bash -c 'export NODE_RANK=$SLURM_PROCID; export RANK_CACHE_DIR="${JOB_CACHE_BASE}/rank_${SLURM_PROCID}"; export TMPDIR="${RANK_CACHE_DIR}/tmp"; export TRITON_CACHE_DIR="${RANK_CACHE_DIR}/triton"; export TORCHINDUCTOR_CACHE_DIR="${RANK_CACHE_DIR}/torchinductor"; export TORCH_EXTENSIONS_DIR="${RANK_CACHE_DIR}/torch_extensions"; mkdir -p "${TMPDIR}" "${TRITON_CACHE_DIR}" "${TORCHINDUCTOR_CACHE_DIR}" "${TORCH_EXTENSIONS_DIR}"; bash scripts/VLM_Dual_Mem/train/train_query_selection_lora.sh'
 else
-  bash scripts/VLM_Dual_Mem/train/train_working_memory_only.sh
+  export RANK_CACHE_DIR="${JOB_CACHE_BASE}/rank_0"
+  export TMPDIR="${RANK_CACHE_DIR}/tmp"
+  export TRITON_CACHE_DIR="${RANK_CACHE_DIR}/triton"
+  export TORCHINDUCTOR_CACHE_DIR="${RANK_CACHE_DIR}/torchinductor"
+  export TORCH_EXTENSIONS_DIR="${RANK_CACHE_DIR}/torch_extensions"
+  mkdir -p "${TMPDIR}" "${TRITON_CACHE_DIR}" "${TORCHINDUCTOR_CACHE_DIR}" "${TORCH_EXTENSIONS_DIR}"
+  bash scripts/VLM_Dual_Mem/train/train_query_selection_lora.sh
 fi
 
 echo "End Time: $(date)"
