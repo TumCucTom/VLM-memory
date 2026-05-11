@@ -82,3 +82,4 @@ work_dirs_auto_eval/
 .env
 ._dbindex_/
 vlm-3r-llava-qwen2-lora/
+.cache/
