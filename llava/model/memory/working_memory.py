@@ -2,6 +2,7 @@
 Working Memory Module for VLM²
 Implements FIFO sliding window mechanism as per Algorithm 1 (Lines 8-14)
 """
+import os
 import torch
 import torch.nn as nn
 from typing import List, Optional
@@ -39,6 +40,10 @@ class WorkingMemory(nn.Module):
     def clear(self):
         """Clear the working memory buffer"""
         if hasattr(self, '_buffer_list'):
+            # Debug: log buffer sizes before clearing
+            if os.environ.get("LLAVA_DEBUG_MEM", "0") == "1":
+                import sys
+                print(f"[WorkingMemory DEBUG] Clearing buffer, current size: {len(self._buffer_list)}", file=sys.stderr)
             self._buffer_list = []
         # In-place so _buffer_size stays on same device as module (avoids CPU tensor when model is on GPU)
         self._buffer_size.zero_()
@@ -86,6 +91,11 @@ class WorkingMemory(nn.Module):
         
         # In-place so _buffer_size stays on same device as module
         self._buffer_size.fill_(len(buffer))
+
+        # Debug: log every N updates to track memory growth
+        if os.environ.get("LLAVA_DEBUG_MEM", "0") == "1" and len(buffer) > 0:
+            import sys
+            print(f"[WorkingMemory DEBUG] Update #{os.environ.get('_WM_UPDATE_COUNT', 0)}: buffer size={len(buffer)}/{self.L_w}", file=sys.stderr)
         return buffer
     
     def to_tensor(self, device: Optional[torch.device] = None) -> torch.Tensor:
