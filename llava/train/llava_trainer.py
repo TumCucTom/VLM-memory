@@ -26,6 +26,26 @@ if is_datasets_available():
 
 from llava.utils import rank0_print
 
+ADAPTER_ONLY_TUNABLE_PARTS = ("mm_mlp_adapter", "mm_vision_resampler", "query_selection", "dual_memory")
+
+
+def _single_adapter_tunable_part(args):
+    tunable_parts = getattr(args, "mm_tunable_parts", None)
+    if not tunable_parts:
+        return None
+    parts = [part.strip() for part in tunable_parts.split(",") if part.strip()]
+    if len(parts) == 1 and parts[0] in ADAPTER_ONLY_TUNABLE_PARTS:
+        return parts[0]
+    return None
+
+
+def _save_light_trainer_state(trainer, output_dir):
+    """Save metadata for model-only adapter checkpoints without DeepSpeed optimizer state."""
+    if trainer.is_world_process_zero():
+        os.makedirs(output_dir, exist_ok=True)
+        trainer.state.save_to_json(os.path.join(output_dir, "trainer_state.json"))
+        torch.save(trainer.args, os.path.join(output_dir, "training_args.bin"))
+
 
 # Borrowed from peft.utils.get_peft_model_state_dict
 def get_peft_state_maybe_zero_3(named_params, bias):
@@ -297,7 +317,7 @@ class LLaVATrainer(Trainer):
 
         # create accelerator object
         self.accelerator = Accelerator(
-            dispatch_batches=self.args.dispatch_batches, split_batches=self.args.split_batches, deepspeed_plugin=self.args.deepspeed_plugin, gradient_accumulation_plugin=gradient_accumulation_plugin, kwargs_handlers=[accelerator_kwargs]
+            deepspeed_plugin=self.args.deepspeed_plugin, gradient_accumulation_plugin=gradient_accumulation_plugin, kwargs_handlers=[accelerator_kwargs]
         )
         # some Trainer classes need to use `gather` instead of `gather_for_metrics`, thus we store a flag
         self.gather_function = self.accelerator.gather_for_metrics
@@ -496,7 +516,7 @@ class LLaVATrainer(Trainer):
             state_dict = get_peft_state_maybe_zero_3(base_model.named_parameters(), self.args.lora_bias)
             non_lora_state_dict = get_peft_state_non_lora_maybe_zero_3(base_model.named_parameters())
             
-            if self.args.local_rank == 0 or self.args.local_rank == -1:
+            if self.is_world_process_zero():
                 os.makedirs(output_dir, exist_ok=True)
                 if hasattr(base_model, "config"):
                     base_model.config.save_pretrained(output_dir)
@@ -504,10 +524,13 @@ class LLaVATrainer(Trainer):
                     base_model.generation_config.save_pretrained(output_dir)
                 base_model.save_pretrained(output_dir, state_dict=state_dict)
                 torch.save(non_lora_state_dict, os.path.join(output_dir, "non_lora_trainables.bin"))
+            if getattr(self.args, "save_only_model", False):
+                _save_light_trainer_state(self, output_dir)
+                return
 
         elif getattr(self.args, "tune_mm_mlp_adapter", False) or (
             getattr(self.args, "tune_fusion_block", False)) or (
-            hasattr(self.args, "mm_tunable_parts") and (len(self.args.mm_tunable_parts.split(",")) == 1 and ("mm_mlp_adapter" in self.args.mm_tunable_parts or "mm_vision_resampler" in self.args.mm_tunable_parts))
+            _single_adapter_tunable_part(self.args) is not None
         ):
             from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 
@@ -516,20 +539,24 @@ class LLaVATrainer(Trainer):
             run_dir = self._get_output_dir(trial=trial)
             output_dir = os.path.join(run_dir, checkpoint_folder)
 
-            # Only save Adapter
-            keys_to_match = ["mm_projector", "vision_resampler", "fusion_block"]
-            if getattr(self.args, "use_im_start_end", False):
-                keys_to_match.extend(["embed_tokens", "embed_in"])
-
-            weight_to_save = get_mm_adapter_state_maybe_zero_3(self.model.named_parameters(), keys_to_match)
-
-            if self.args.local_rank == 0 or self.args.local_rank == -1:
+            if self.is_world_process_zero():
+                os.makedirs(output_dir, exist_ok=True)
                 self.model.config.save_pretrained(output_dir)
-                torch.save(weight_to_save, os.path.join(output_dir, f"mm_projector.bin"))
-                # Also save non-LoRA trainables (working_memory, episodic_memory, etc.) for evaluation
+                if hasattr(self.model, "generation_config"):
+                    self.model.generation_config.save_pretrained(output_dir)
                 base_model = model.module if hasattr(model, "module") else model
                 non_lora_state_dict = get_peft_state_non_lora_maybe_zero_3(base_model.named_parameters())
                 torch.save(non_lora_state_dict, os.path.join(output_dir, "non_lora_trainables.bin"))
+                adapter_part = _single_adapter_tunable_part(self.args)
+                if adapter_part in ("mm_mlp_adapter", "mm_vision_resampler") or getattr(self.args, "tune_mm_mlp_adapter", False) or getattr(self.args, "tune_fusion_block", False):
+                    keys_to_match = ["mm_projector", "vision_resampler", "fusion_block"]
+                    if getattr(self.args, "use_im_start_end", False):
+                        keys_to_match.extend(["embed_tokens", "embed_in"])
+                    weight_to_save = get_mm_adapter_state_maybe_zero_3(self.model.named_parameters(), keys_to_match)
+                    torch.save(weight_to_save, os.path.join(output_dir, f"mm_projector.bin"))
+            if getattr(self.args, "save_only_model", False):
+                _save_light_trainer_state(self, output_dir)
+                return
 
         # 保存其他训练状态（优化器状态等）
         super(LLaVATrainer, self)._save_checkpoint(model, trial, metrics)
