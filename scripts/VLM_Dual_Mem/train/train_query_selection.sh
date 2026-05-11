@@ -29,6 +29,7 @@ USE_QUERY_SELECTION="${USE_QUERY_SELECTION:-True}"
 QUERY_SELECTION_NUM_SELECT="${QUERY_SELECTION_NUM_SELECT:-32}"
 QUERY_SELECTION_TEMPERATURE="${QUERY_SELECTION_TEMPERATURE:-1.0}"
 QUERY_SELECTION_USE_GUMBEL="${QUERY_SELECTION_USE_GUMBEL:-True}"
+QUERY_SELECTION_PROJECT_SELECTED="${QUERY_SELECTION_PROJECT_SELECTED:-True}"
 FRAMES_UPBOUND="${FRAMES_UPBOUND:-128}"
 FORCE_SAMPLE="${FORCE_SAMPLE:-True}"
 
@@ -53,6 +54,7 @@ if [[ -z "${GRADIENT_ACCUMULATION_STEPS+x}" ]]; then
 fi
 SAVE_STEPS="${SAVE_STEPS:-50}"
 SAVE_TOTAL_LIMIT="${SAVE_TOTAL_LIMIT:-20}"
+SAVE_ONLY_MODEL="${SAVE_ONLY_MODEL:-False}"
 MAX_STEPS="${MAX_STEPS:-}"
 DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-0}"
 # Resume: set RESUME_FROM_CHECKPOINT=true (or path to checkpoint) to resume; default is no resume
@@ -88,10 +90,11 @@ echo "=========================================="
 echo "Query-based frame selection (VideoStreaming)"
 echo "=========================================="
 echo "Model: ${MODEL_PATH}"
-echo "Query selection: num_select=${QUERY_SELECTION_NUM_SELECT}, temp=${QUERY_SELECTION_TEMPERATURE}"
+echo "Query selection: num_select=${QUERY_SELECTION_NUM_SELECT}, temp=${QUERY_SELECTION_TEMPERATURE}, project_selected=${QUERY_SELECTION_PROJECT_SELECTED}"
 echo "Frame sampling: frames_upbound=${FRAMES_UPBOUND}, force_sample=${FORCE_SAMPLE}"
 echo "Distributed: nnodes=${NNODES}, gpus_per_node=${NUM_GPUS_PER_NODE}, batch=${BATCH_SIZE}, grad_accum=${GRADIENT_ACCUMULATION_STEPS}, target_effective_batch=${TARGET_EFFECTIVE_BATCH}"
 echo "Training: epochs=${NUM_TRAIN_EPOCHS}, save_steps=${SAVE_STEPS}, save_total_limit=${SAVE_TOTAL_LIMIT}"
+echo "Checkpointing: save_only_model=${SAVE_ONLY_MODEL}, resume_from_checkpoint=${RESUME_FROM_CHECKPOINT:-<none>}"
 echo "Output: ${OUTPUT_DIR}"
 echo "=========================================="
 
@@ -130,6 +133,7 @@ ACCELERATE_CPU_AFFINITY=0 torchrun \
     --query_selection_num_select ${QUERY_SELECTION_NUM_SELECT} \
     --query_selection_temperature ${QUERY_SELECTION_TEMPERATURE} \
     --query_selection_use_gumbel ${QUERY_SELECTION_USE_GUMBEL} \
+    --query_selection_project_selected ${QUERY_SELECTION_PROJECT_SELECTED} \
     --mm_tunable_parts "query_selection" \
     --vision_tower ${VISION_MODEL_VERSION} \
     --mm_projector_type mlp2x_gelu \
@@ -153,6 +157,7 @@ ACCELERATE_CPU_AFFINITY=0 torchrun \
     --save_strategy "steps" \
     --save_steps ${SAVE_STEPS} \
     --save_total_limit ${SAVE_TOTAL_LIMIT} \
+    --save_only_model ${SAVE_ONLY_MODEL} \
     --learning_rate ${LEARNING_RATE} \
     --weight_decay 0. \
     --warmup_ratio 0.03 \

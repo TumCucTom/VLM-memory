@@ -33,6 +33,7 @@ import math
 import re
 import multiprocessing
 import torch
+from collections import defaultdict
 
 # Init NCCL process group with long timeout before DeepSpeed is imported (DeepSpeed inits with 10 min default otherwise)
 if os.environ.get("RANK") is not None and not torch.distributed.is_initialized():
@@ -272,6 +273,9 @@ class ModelArguments:
     tune_fusion_block: bool = field(default=False)
 
     ## memory components (dual memory system)
+    use_dual_memory: bool = field(default=True, metadata={"help": "Enable the dual-memory forward path. Query-selection-only runs can disable it."})
+    checkpoint_adapter: Optional[str] = field(default=None, metadata={"help": "Optional checkpoint directory whose adapter/memory weights are overlaid on top of base + task LoRA."})
+    checkpoint_overlay_memory_only: bool = field(default=True, metadata={"help": "When checkpoint_adapter is set, overlay only memory weights instead of all adapter weights."})
     tune_memory_components: bool = field(default=False, metadata={"help": "Enable training of memory components (working_attention, episodic_attention, memory_fusion_mlp, salience_gate)"})
     memory_mode: str = field(default="working_only", metadata={"help": "Memory training mode: 'working_only', 'episodic_only', or 'both' (default: working_only)"})
     memory_L_w: int = field(default=8, metadata={"help": "Working memory capacity (L_w)"})
@@ -280,12 +284,15 @@ class ModelArguments:
     memory_dropout: float = field(default=0.1, metadata={"help": "Dropout for memory modules"})
     memory_lora_r: int = field(default=64, metadata={"help": "LoRA rank for memory attention modules"})
     memory_lora_alpha: int = field(default=128, metadata={"help": "LoRA alpha for memory attention modules"})
+    episodic_memory_gated_attention: bool = field(default=True, metadata={"help": "Enable episodic-memory salience gate. Disable to store/update episodic memory without salience filtering."})
 
     ## query-based selection (VideoStreaming Section 3.3)
     use_query_selection: bool = field(default=False, metadata={"help": "Enable query-based clip selection (VideoStreaming style)"})
     query_selection_num_select: int = field(default=4, metadata={"help": "Number of clips to select (V from VideoStreaming paper, default 4)"})
     query_selection_temperature: float = field(default=1.0, metadata={"help": "Gumbel temperature for differentiable selection"})
     query_selection_use_gumbel: bool = field(default=True, metadata={"help": "Use Gumbel-Topk (True) or hard Topk (False)"})
+    query_selection_project_selected: bool = field(default=True, metadata={"help": "Project selected visual tokens through the query-selection LLM input MLP. Set False to pass raw selected LLaVA visual tokens to the LLM."})
+    query_selection_disable_dual_memory: bool = field(default=True, metadata={"help": "Disable dual memory when query selection is enabled. Set False to use query selection before a frozen/trained memory module."})
 
     unfreeze_mm_vision_tower: bool = field(default=False)
     unfreeze_language_model: bool = field(default=False)
@@ -487,36 +494,33 @@ def find_all_linear_names(model, include_memory_components=False):
 
 def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: str):
     """Collects the state dict and dump to disk."""
-    if hasattr(trainer.args, "tune_mm_mlp_adapter") and trainer.args.tune_mm_mlp_adapter:
-        check_only_save_mm_adapter_tunnable = True
-    if hasattr(trainer.args, "tune_fusion_block") and trainer.args.tune_fusion_block:
-        check_only_save_mm_adapter_tunnable = True
-    # only has mm_mlp_adapter and mm_vision_resampler in the tuneable parts
-    elif hasattr(trainer.args, "mm_tunable_parts") and (len(trainer.args.mm_tunable_parts.split(",")) == 1 and ("mm_mlp_adapter" in trainer.args.mm_tunable_parts or "mm_vision_resampler" in trainer.args.mm_tunable_parts)):
-        check_only_save_mm_adapter_tunnable = True
-    else:
-        check_only_save_mm_adapter_tunnable = False
+    single_tunable_part = None
+    if hasattr(trainer.args, "mm_tunable_parts") and trainer.args.mm_tunable_parts:
+        tunable_parts = [part.strip() for part in trainer.args.mm_tunable_parts.split(",") if part.strip()]
+        if len(tunable_parts) == 1:
+            single_tunable_part = tunable_parts[0]
+    check_only_save_mm_adapter_tunnable = bool(
+        (hasattr(trainer.args, "tune_mm_mlp_adapter") and trainer.args.tune_mm_mlp_adapter)
+        or (hasattr(trainer.args, "tune_fusion_block") and trainer.args.tune_fusion_block)
+        or single_tunable_part in ("mm_mlp_adapter", "mm_vision_resampler", "query_selection", "dual_memory")
+    )
 
     trainer.accelerator.wait_for_everyone()
     torch.cuda.synchronize()
-    rank0_print(f"Only save projectors: {check_only_save_mm_adapter_tunnable}")
+    rank0_print(f"Only save adapter/trainables: {check_only_save_mm_adapter_tunnable}")
     if check_only_save_mm_adapter_tunnable:
-        # Only save Adapter
-        keys_to_match = ["mm_projector", "vision_resampler", "fusion_block"] # save fusion_block and projectors
-        if getattr(trainer.args, "use_im_start_end", False):
-            keys_to_match.extend(["embed_tokens", "embed_in"])
-
-        weight_to_save = get_mm_adapter_state_maybe_zero_3(trainer.model.named_parameters(), keys_to_match)
-        trainer.model.config.save_pretrained(output_dir)
-
-        current_folder = output_dir.split("/")[-1]
-        parent_folder = os.path.dirname(output_dir)
-        if trainer.args.local_rank == 0 or trainer.args.local_rank == -1:
-            if current_folder.startswith("checkpoint-"):
-                mm_projector_folder = os.path.join(parent_folder, "mm_projector")
-                os.makedirs(mm_projector_folder, exist_ok=True)
-                torch.save(weight_to_save, os.path.join(mm_projector_folder, f"{current_folder}.bin"))
-            else:
+        if trainer.is_world_process_zero():
+            os.makedirs(output_dir, exist_ok=True)
+            trainer.model.config.save_pretrained(output_dir)
+            if hasattr(trainer.model, "generation_config"):
+                trainer.model.generation_config.save_pretrained(output_dir)
+            non_lora_state_dict = get_peft_state_non_lora_maybe_zero_3(trainer.model.named_parameters())
+            torch.save(non_lora_state_dict, os.path.join(output_dir, "non_lora_trainables.bin"))
+            if single_tunable_part in ("mm_mlp_adapter", "mm_vision_resampler") or getattr(trainer.args, "tune_mm_mlp_adapter", False) or getattr(trainer.args, "tune_fusion_block", False):
+                keys_to_match = ["mm_projector", "vision_resampler", "fusion_block"]
+                if getattr(trainer.args, "use_im_start_end", False):
+                    keys_to_match.extend(["embed_tokens", "embed_in"])
+                weight_to_save = get_mm_adapter_state_maybe_zero_3(trainer.model.named_parameters(), keys_to_match)
                 torch.save(weight_to_save, os.path.join(output_dir, f"mm_projector.bin"))
         return
 
@@ -529,6 +533,70 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: st
         cpu_state_dict = {key: value.cpu() for key, value in state_dict.items()}
         del state_dict
         trainer._save(output_dir, state_dict=cpu_state_dict)  # noqa
+
+
+def overlay_checkpoint_adapter_weights(model, checkpoint_adapter: Optional[str], memory_only: bool = True):
+    """Overlay trained adapter/memory weights from a checkpoint onto an already-built model."""
+    if not checkpoint_adapter or not os.path.isdir(checkpoint_adapter):
+        return
+
+    all_prefixes = (
+        "model.fusion_block.",
+        "model.mm_projector.",
+        "model.vision_resampler.",
+        "model.working_memory.",
+        "model.episodic_memory.",
+        "model.memory_fusion_mlp.",
+        "model.spatial_tower.",
+        "model.working_attention.",
+        "model.episodic_attention.",
+        "model.query_selection.",
+    )
+    memory_prefixes = (
+        "model.working_memory.",
+        "model.episodic_memory.",
+        "model.memory_fusion_mlp.",
+        "model.working_attention.",
+        "model.episodic_attention.",
+    )
+    prefixes = memory_prefixes if memory_only else all_prefixes
+    rank0_print(f"Overlaying {'memory-only' if memory_only else 'adapter'} weights from checkpoint: {checkpoint_adapter}")
+
+    overlaid = 0
+    index_path = os.path.join(checkpoint_adapter, "model.safetensors.index.json")
+    if os.path.isfile(index_path):
+        from safetensors.torch import load_file
+
+        with open(index_path) as f:
+            index = json.load(f)
+        weight_map = index.get("weight_map", {})
+        adapter_keys = [key for key in weight_map if any(key.startswith(prefix) for prefix in prefixes)]
+        keys_by_shard = defaultdict(list)
+        for key in adapter_keys:
+            keys_by_shard[weight_map[key]].append(key)
+        for shard, shard_keys in sorted(keys_by_shard.items()):
+            shard_path = os.path.join(checkpoint_adapter, shard)
+            if not os.path.isfile(shard_path):
+                continue
+            shard_state = load_file(shard_path)
+            adapter_dict = {key: shard_state[key] for key in shard_keys if key in shard_state}
+            if adapter_dict:
+                model.load_state_dict(adapter_dict, strict=False)
+                overlaid += len(adapter_dict)
+            del shard_state, adapter_dict
+
+    non_lora_path = os.path.join(checkpoint_adapter, "non_lora_trainables.bin")
+    if os.path.isfile(non_lora_path):
+        non_lora = torch.load(non_lora_path, map_location="cpu")
+        non_lora = {(k[11:] if k.startswith("base_model.") else k): v for k, v in non_lora.items()}
+        if any(k.startswith("model.model.") for k in non_lora):
+            non_lora = {(k[6:] if k.startswith("model.") else k): v for k, v in non_lora.items()}
+        non_lora = {k: v for k, v in non_lora.items() if any(k.startswith(prefix) for prefix in prefixes)}
+        if non_lora:
+            model.load_state_dict(non_lora, strict=False)
+            overlaid += len(non_lora)
+
+    rank0_print(f"Overlaid {overlaid} adapter/memory weights from {checkpoint_adapter}")
 
 
 def smart_tokenizer_and_embedding_resize(
@@ -2108,8 +2176,26 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
         overwrite_config["fusion_block"] = model_args.fusion_block
 
     if model_args.vision_tower is not None:
+        overwrite_config["use_dual_memory"] = getattr(model_args, "use_dual_memory", True)
+        overwrite_config["memory_mode"] = getattr(model_args, "memory_mode", "working_only")
         overwrite_config["working_memory_size"] = getattr(model_args, "memory_L_w", 8)
         overwrite_config["episodic_memory_size"] = getattr(model_args, "memory_L_e", 32)
+        overwrite_config["episodic_memory_gated_attention"] = getattr(model_args, "episodic_memory_gated_attention", True)
+
+    checkpoint_adapter = getattr(model_args, "checkpoint_adapter", None)
+    if checkpoint_adapter and os.path.isdir(checkpoint_adapter):
+        checkpoint_config_path = os.path.join(checkpoint_adapter, "config.json")
+        if os.path.isfile(checkpoint_config_path):
+            with open(checkpoint_config_path) as f:
+                checkpoint_config = json.load(f)
+            for key in (
+                "working_memory_size",
+                "episodic_memory_size",
+                "episodic_memory_gated_attention",
+                "memory_fusion_hidden_dim",
+            ):
+                if key in checkpoint_config:
+                    overwrite_config[key] = checkpoint_config[key]
 
     if overwrite_config:
         assert cfg_pretrained is not None, "cfg_pretrained is None"
@@ -2284,9 +2370,14 @@ def train(attn_implementation=None):
     model = get_model(model_args, training_args, bnb_model_from_pretrained_args)
     model.config.use_cache = False
 
-    # Load and merge task LoRA (e.g. VLM-3R) so we always train on top of it
+    # Load task LoRA (e.g. VLM-3R) so we always train on top of it.
+    # If lora_enable=True, keep the task LoRA adapter trainable and update it
+    # in place. Otherwise merge it into the base model for frozen-adapter runs.
     memory_mode = getattr(model_args, "memory_mode", "working_only")
     task_lora_path = (getattr(training_args, "lora_weight_path", None) or "").strip()
+    checkpoint_adapter_path = (getattr(model_args, "checkpoint_adapter", None) or "").strip()
+    checkpoint_overlay_memory_only = getattr(model_args, "checkpoint_overlay_memory_only", True)
+    loaded_trainable_task_lora = False
     if task_lora_path:
         # Load non_lora_trainables (mm_projector, vision_resampler, fusion_block) from task LoRA so we match valid eval
         import os as _os
@@ -2308,13 +2399,20 @@ def train(attn_implementation=None):
             model.load_state_dict(_nl, strict=False)
         else:
             rank0_print("No non_lora_trainables in task LoRA; training uses base projectors.")
+        overlay_checkpoint_adapter_weights(model, checkpoint_adapter_path, memory_only=checkpoint_overlay_memory_only)
         from peft import PeftModel
         rank0_print(f"Loading task LoRA from {task_lora_path}...")
-        model = PeftModel.from_pretrained(model, task_lora_path, is_trainable=False)
-        rank0_print("Merging task LoRA into base model...")
-        model = model.merge_and_unload()
-        rank0_print("Task LoRA merged; training uses base + non_lora + LoRA (same as valid eval).")
+        if training_args.lora_enable:
+            model = PeftModel.from_pretrained(model, task_lora_path, is_trainable=True)
+            loaded_trainable_task_lora = True
+            rank0_print("Task LoRA loaded as trainable; training will update task LoRA + requested non-LoRA modules.")
+        else:
+            model = PeftModel.from_pretrained(model, task_lora_path, is_trainable=False)
+            rank0_print("Merging task LoRA into base model...")
+            model = model.merge_and_unload()
+            rank0_print("Task LoRA merged; training uses base + non_lora + LoRA (same as valid eval).")
     else:
+        overlay_checkpoint_adapter_weights(model, checkpoint_adapter_path, memory_only=checkpoint_overlay_memory_only)
         if memory_mode in ("working_only", "both"):
             rank0_print("WARNING: No lora_weight_path set. Training will use the BASE MODEL ONLY (no VLM-3R task LoRA). "
                         "Set --lora_weight_path e.g. Journey9ni/vlm-3r-llava-qwen2-lora to train on top of VLM-3R.")
@@ -2344,7 +2442,7 @@ def train(attn_implementation=None):
 
             model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
 
-    if training_args.lora_enable:
+    if training_args.lora_enable and not loaded_trainable_task_lora:
         from peft import LoraConfig, get_peft_model
 
         # Memory components are trained fully (not via LoRA) since they're small
@@ -2366,6 +2464,8 @@ def train(attn_implementation=None):
                 model.to(torch.float16)
         rank0_print("Adding LoRA adapters...")
         model = get_peft_model(model, lora_config)
+    elif training_args.lora_enable and loaded_trainable_task_lora:
+        rank0_print("Using loaded task LoRA adapters as trainable; not adding fresh LoRA adapters.")
 
     if "mistral" in model_args.model_name_or_path.lower() or "mixtral" in model_args.model_name_or_path.lower() or "zephyr" in model_args.model_name_or_path.lower():
         tokenizer = transformers.AutoTokenizer.from_pretrained(model_args.model_name_or_path, cache_dir=training_args.cache_dir, model_max_length=training_args.model_max_length, padding_side="left")
@@ -2471,13 +2571,19 @@ def train(attn_implementation=None):
         use_query_selection = getattr(model_args, 'use_query_selection', False)
         model.config.use_query_selection = use_query_selection
         if use_query_selection:
-            model.config.use_dual_memory = False
+            use_dual_memory_with_query = bool(getattr(model_args, "use_dual_memory", True)) and not bool(getattr(model_args, "query_selection_disable_dual_memory", True))
+            model.config.use_dual_memory = use_dual_memory_with_query
             if hasattr(model, "get_model"):
-                model.get_model().config.use_dual_memory = False
+                model.get_model().config.use_dual_memory = use_dual_memory_with_query
             model.config.query_selection_num_select = getattr(model_args, 'query_selection_num_select', 4)
             model.config.query_selection_temperature = getattr(model_args, 'query_selection_temperature', 1.0)
             model.config.query_selection_use_gumbel = getattr(model_args, 'query_selection_use_gumbel', True)
-            rank0_print(f"Query-based selection enabled: select {model.config.query_selection_num_select} clips")
+            model.config.query_selection_project_selected = getattr(model_args, 'query_selection_project_selected', True)
+            rank0_print(
+                f"Query-based selection enabled: select {model.config.query_selection_num_select} clips, "
+                f"project_selected={model.config.query_selection_project_selected}, "
+                f"use_dual_memory={model.config.use_dual_memory}"
+            )
 
         if model_args.mm_tunable_parts is None:  # traditional way of deciding which part to train
             model.config.tune_mm_mlp_adapter = training_args.tune_mm_mlp_adapter = model_args.tune_mm_mlp_adapter
@@ -2608,6 +2714,11 @@ def train(attn_implementation=None):
             model.config.memory_mode = getattr(model_args, "memory_mode", "working_only")
             # Set the entire model to not require gradients by default
             model.requires_grad_(False)
+            if training_args.lora_enable:
+                rank0_print("Unfreezing LoRA adapter parameters...")
+                for name, param in model.named_parameters():
+                    if "lora_" in name:
+                        param.requires_grad = True
             vision_tower.requires_grad_(False)
             model.get_model().mm_projector.requires_grad_(False)
             model.get_model().vision_resampler.requires_grad_(False)
@@ -2668,10 +2779,11 @@ def train(attn_implementation=None):
                     model_base = model.get_model()
                     # Propagate query_selection config to model_base so lazy init can read it
                     model_base.config.use_query_selection = getattr(model.config, 'use_query_selection', False)
-                    model_base.config.use_dual_memory = False
+                    model_base.config.use_dual_memory = getattr(model.config, 'use_dual_memory', False)
                     model_base.config.query_selection_num_select = getattr(model.config, 'query_selection_num_select', 4)
                     model_base.config.query_selection_temperature = getattr(model.config, 'query_selection_temperature', 1.0)
                     model_base.config.query_selection_use_gumbel = getattr(model.config, 'query_selection_use_gumbel', True)
+                    model_base.config.query_selection_project_selected = getattr(model.config, 'query_selection_project_selected', True)
                     # Trigger lazy initialization via get_query_selection()
                     query_sel = model_base.get_query_selection()
                     if query_sel is not None:
@@ -2680,8 +2792,7 @@ def train(attn_implementation=None):
                         rank0_print("  - query_selection: trainable")
                     else:
                         rank0_print("  - query_selection module not found or is None in model")
-                # Also disable dual memory when using query selection
-                model.config.use_dual_memory = False
+                model.config.use_dual_memory = bool(getattr(model.config, 'use_dual_memory', False))
 
         total_params = sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in model.parameters())
         trainable_params = sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in model.parameters() if p.requires_grad)
@@ -2729,7 +2840,7 @@ def train(attn_implementation=None):
         callbacks.append(FirstStepFramesCallback(effective_frames_value, data_args))
     trainer = LLaVATrainer(model=model, tokenizer=tokenizer, args=training_args, callbacks=callbacks, **data_module)
 
-    trainer.train()
+    trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
     trainer.save_state()
 
     model.config.use_cache = True
@@ -2737,7 +2848,7 @@ def train(attn_implementation=None):
     if training_args.lora_enable:
         state_dict = get_peft_state_maybe_zero_3(model.named_parameters(), training_args.lora_bias)
         non_lora_state_dict = get_peft_state_non_lora_maybe_zero_3(model.named_parameters())
-        if training_args.local_rank == 0 or training_args.local_rank == -1:
+        if trainer.is_world_process_zero():
             if hasattr(model, "config"):
                 model.config.save_pretrained(training_args.output_dir)
             if hasattr(model, "generation_config"):

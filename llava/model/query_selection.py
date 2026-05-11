@@ -35,6 +35,7 @@ class QueryBasedSelection(nn.Module):
         num_select: int = 4,
         temperature: float = 1.0,
         use_gumbel: bool = True,
+        project_selected: bool = True,
     ):
         """
         Args:
@@ -43,6 +44,9 @@ class QueryBasedSelection(nn.Module):
             num_select: Number of clips to select (V from paper, default 4)
             temperature: Gumbel temperature for differentiable selection
             use_gumbel: Whether to use Gumbel-Topk (True) or hard Topk (False)
+            project_selected: Whether to project selected visual tokens through
+                the LLM input MLP before returning them. If False, selected raw
+                LLaVA visual tokens are returned unchanged after selection.
         """
         super().__init__()
         self.feature_dim = feature_dim
@@ -50,6 +54,8 @@ class QueryBasedSelection(nn.Module):
         self.num_select = num_select
         self.temperature = temperature
         self.use_gumbel = use_gumbel
+        self.project_selected = project_selected
+        self.last_trace = None
         inter_dim = self.INTERMEDIATE_DIM
 
         # Streaming encoder MLP (Section 3.3): projects clip features to intermediate space
@@ -96,6 +102,7 @@ class QueryBasedSelection(nn.Module):
 
         B, T = clip_features.shape[:2]
         if T == 0:
+            self.last_trace = None
             return clip_features
         k = min(self.num_select, T)
 
@@ -143,28 +150,63 @@ class QueryBasedSelection(nn.Module):
             # Hard selection for inference
             indices = similarities.topk(k, dim=-1).indices
 
+        # Preserve video chronology after selecting the top-k frames/clips.
+        # torch.topk returns score order; the LLM expects temporal order.
+        if k > 1:
+            indices, chronological_order = torch.sort(indices, dim=-1)
+            if selected_weights is not None:
+                selected_weights = selected_weights.gather(dim=-1, index=chronological_order)
+
+        selected_scores = similarities.gather(dim=-1, index=indices)
+        self.last_trace = {
+            "num_candidates": int(T),
+            "num_selected": int(k),
+            "selected_indices": indices.detach().cpu().tolist(),
+            "selected_scores": selected_scores.detach().float().cpu().tolist(),
+            "similarities": similarities.detach().float().cpu().tolist(),
+            "used_gumbel": bool(self.use_gumbel and self.training),
+            "temperature": float(self.temperature),
+            "project_selected": bool(self.project_selected),
+            "clip_feature_shape": list(clip_features.shape),
+            "question_embed_shape": list(question_embeds.shape),
+        }
+
         # Gather selected clip features
         if clip_features.dim() == 4:
             # [B, T, N, D] - get selected clips
             _, _, N_tokens, D = clip_features.shape
             gather_idx = indices[:, :, None, None].expand(-1, -1, N_tokens, D)
             gathered = clip_features.gather(dim=1, index=gather_idx)  # [B, V, N, D]
-            selected_flat = gathered.reshape(B * k * N_tokens, D)
-            selected_flat = self.clip_projector(selected_flat)  # [B*V*N, 2560]
-            selected_flat = self.llm_input_projector(selected_flat)  # [B*V*N, llm_dim]
-            selected = selected_flat.view(B, k, N_tokens, -1)
+            if self.project_selected:
+                selected_flat = gathered.reshape(B * k * N_tokens, D)
+                selected_flat = self.clip_projector(selected_flat)  # [B*V*N, 2560]
+                selected_flat = self.llm_input_projector(selected_flat)  # [B*V*N, llm_dim]
+                selected = selected_flat.view(B, k, N_tokens, -1)
+            else:
+                if D != self.llm_dim:
+                    raise ValueError(
+                        f"Raw query selection requires selected token dim {D} to match llm_dim {self.llm_dim}"
+                    )
+                selected = gathered
             if selected_weights is not None:
                 selected = selected * selected_weights[:, :, None, None]
         else:
             # [B, V, D]
             D = clip_features.shape[-1]
             gather_idx = indices[:, :, None].expand(-1, -1, D)
-            selected = clip_features.gather(dim=1, index=gather_idx)
-            # Project selected clips back to LLM dimension via LLM input MLP
-            selected = selected.reshape(B * k, D)
-            selected = self.clip_projector(selected)  # [B*V, 2560]
-            selected = self.llm_input_projector(selected)  # [B*V, llm_dim]
-            selected = selected.view(B, k, -1)  # [B, V, llm_dim]
+            gathered = clip_features.gather(dim=1, index=gather_idx)
+            if self.project_selected:
+                # Project selected clips back to LLM dimension via LLM input MLP
+                selected = gathered.reshape(B * k, D)
+                selected = self.clip_projector(selected)  # [B*V, 2560]
+                selected = self.llm_input_projector(selected)  # [B*V, llm_dim]
+                selected = selected.view(B, k, -1)  # [B, V, llm_dim]
+            else:
+                if D != self.llm_dim:
+                    raise ValueError(
+                        f"Raw query selection requires selected token dim {D} to match llm_dim {self.llm_dim}"
+                    )
+                selected = gathered
             if selected_weights is not None:
                 selected = selected * selected_weights[:, :, None]
 
@@ -200,8 +242,10 @@ class QuerySelectionConfig:
         query_selection_num_select: int = 4,
         query_selection_temperature: float = 1.0,
         query_selection_use_gumbel: bool = True,
+        query_selection_project_selected: bool = True,
     ):
         self.use_query_selection = use_query_selection
         self.query_selection_num_select = query_selection_num_select
         self.query_selection_temperature = query_selection_temperature
         self.query_selection_use_gumbel = query_selection_use_gumbel
+        self.query_selection_project_selected = query_selection_project_selected
