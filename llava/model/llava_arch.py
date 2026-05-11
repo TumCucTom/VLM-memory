@@ -123,6 +123,7 @@ class LlavaMetaModel:
                     num_select=num_select,
                     temperature=temperature,
                     use_gumbel=getattr(config, 'query_selection_use_gumbel', True),
+                    project_selected=getattr(config, 'query_selection_project_selected', True),
                 ).to(qs_dtype)
             # Note: Do NOT set self.query_selection = None here. Lazy init will handle
             # the case where use_query_selection is set to True after model creation.
@@ -178,6 +179,7 @@ class LlavaMetaModel:
             num_select=num_select,
             temperature=temperature,
             use_gumbel=getattr(self.config, 'query_selection_use_gumbel', True),
+            project_selected=getattr(self.config, 'query_selection_project_selected', True),
         ).to(qs_dtype)
         return self.query_selection
 
@@ -965,31 +967,9 @@ class LlavaMetaForCausalLM(ABC):
             self.get_model().get_episodic_memory() is not None
         ):
             image_features = self.get_model()._apply_dual_memory(image_features)
-            # Training: ensure loss has grad path to working_attention (frozen vision tower breaks graph otherwise).
-            if self.training and self.get_model().get_working_memory() is not None:
-                wa = self.get_model().working_attention
-                if image_features.dim() == 3:
-                    out_list = []
-                    for i in range(image_features.shape[0]):
-                        q = image_features[i : i + 1]  # [1, N, D]
-                        o, _ = wa(q, q, q)
-                        out_list.append(o.squeeze(0))
-                    safety_out = torch.stack(out_list, dim=0)
-                else:
-                    q = image_features.unsqueeze(0) if image_features.dim() == 2 else image_features
-                    if q.dim() == 2:
-                        q = q.unsqueeze(0)
-                    o, _ = wa(q, q, q)
-                    safety_out = o.squeeze(0)
-                # Force grad path: 0 in forward but carries grad from working_attention in backward.
-                image_features = image_features + (safety_out - safety_out.detach())
-            # Debug: ensure encode path produces grad when training with working memory
-            if self.training and self.get_model().get_working_memory() is not None:
-                if _DEBUG_GRAD:
-                    print(f"[DEBUG] encode_images returning: requires_grad={image_features.requires_grad}, grad_fn={image_features.grad_fn}")
-                assert image_features.requires_grad, "encode_images: output should require_grad when training with working memory"
+
         return image_features
-    
+
     def encode_multimodals(self, videos_or_images, video_idx_in_batch, split_sizes=None):
         videos_or_images_features = self.get_model().get_vision_tower()(videos_or_images)
         per_videos_or_images_features = torch.split(videos_or_images_features, split_sizes, dim=0)  # tuple, (dim_1, 576, 4096)
@@ -1001,13 +981,13 @@ class LlavaMetaForCausalLM(ABC):
             
             feat = self.get_model().mm_projector(feat)
             faster_video_feature = 0
-            slower_img_feat = 0
+            slower_img_feat = None
             if idx in video_idx_in_batch and cur_mm_spatial_pool_stride > 1:
                 slower_img_feat = self.get_2dPool(feat,cur_mm_spatial_pool_stride)
                 if self.config.add_faster_video:
                     cur_mm_spatial_pool_stride = cur_mm_spatial_pool_stride * 2
                     faster_video_feature = self.get_2dPool(feat,cur_mm_spatial_pool_stride)
-            if slower_img_feat is not 0:
+            if slower_img_feat is not None:
                 all_videos_or_images_features.append(slower_img_feat)
             else:
                 all_videos_or_images_features.append(feat)
@@ -1091,7 +1071,7 @@ class LlavaMetaForCausalLM(ABC):
         model_config = self.get_model().config
         qs = self.get_model().get_query_selection()
         use_qs = getattr(model_config, "use_query_selection", False)
-        if not (use_qs and qs is not None and self.training):
+        if not (use_qs and qs is not None):
             return self._flatten_media_features(image_features)
 
         if image_features is None or image_features.shape[0] == 0:
